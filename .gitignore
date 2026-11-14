@@ -1,0 +1,7 @@
+# runtime artifacts (never commit local calibration output)
+runs/
+*.csv
+*.log
+*.tstat
+result.env
+summary.txt

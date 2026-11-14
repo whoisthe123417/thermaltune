@@ -1,0 +1,988 @@
+#!/usr/bin/env bash
+# thermaltune — calibrate the highest stable CPU cap on thermally-limited x86 laptops.
+#
+# Finds the maximum frequency cap where a sustained all-core load runs FLAT
+# (no thermal sawtooth: no dips to the throttle floor, peak temp in bounds),
+# then applies and persists it. A calibrated cap sustains MORE throughput than
+# leaving the CPU uncapped, because uncapped machines oscillate between bursts
+# and deep thermal throttling.
+#
+# Provenance: AI-authored (GLM via OpenCode), hardware-validated on a
+# Surface Laptop Go 1 (i5-1035G1, CachyOS). See docs/validation.md.
+# License: MIT — see LICENSE.
+#
+# Usage: thermaltune <command> [options]
+#   calibrate            Find + apply + persist the sweet-spot cap (sudo handled)
+#   check                Verify the saved cap still runs flat (~4 min)
+#   status               Current state summary
+#   doctor               System audit: drivers, sensors, conflicts, deps
+#   apply|on             Re-apply the saved cap (used by systemd units)
+#   off                  Temporarily remove the cap (until next boot/resume)
+#   uninstall            Remove persistence and restore full speed
+#   install-persistence  (Re)install the systemd unit + resume hook
+#   --selftest [dir]     Validate the analyzer against recorded calibration data
+#
+# Options:
+#   --profile quick|thorough   Sweep depth (default: thorough)
+#   --target-temp N            Peak package temp target °C (default: derived, <=85)
+#   --load-seconds N           Per-step sustained load seconds (default: 210)
+#
+# Design notes:
+#   * Two-phase privilege: popups/consent run as YOUR user; only the
+#     measurement core runs under sudo. No GUI ever launched as root.
+#   * Calibration runs under systemd-inhibit so suspend cannot corrupt it.
+#   * Only lowers ceilings — never raises voltage, power limits or clocks.
+#   * Ctrl+C during calibration restores the previous cap.
+
+set -u
+umask 022
+
+VERSION="0.1.0"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+CONF="/etc/thermaltune.conf"
+UNIT="/etc/systemd/system/thermaltune.service"
+HOOK="/usr/lib/systemd/system-sleep/thermaltune-resume"
+BIN="/usr/local/bin/thermaltune"
+RUNS_ROOT="/var/lib/thermaltune/runs"
+
+LOAD_S=210
+SETTLE_S=75
+COOL_CAP_S=150
+SAMPLE_EVERY=5
+CHECK_LOAD_S=240
+DEFAULT_TARGET=85
+
+PROFILE="thorough"
+TARGET_TEMP=""
+CAP_MODE="pct"
+ORIG_MAX_FREQ=0
+UI_TOOL="tty"
+PKG_TEMP_FILE=""
+PKG_CRIT_FILE=""
+
+die()   { echo "thermaltune: error: $*" >&2; exit 1; }
+log()   { echo "[thermaltune] $*"; }
+warn()  { echo "[thermaltune] WARNING: $*" >&2; }
+
+# ---------------------------------------------------------------- detection --
+
+detect_platform() {
+    [ "$(uname -m)" = "x86_64" ] || die "unsupported architecture: $(uname -m) (x86_64 laptops only)"
+    local vendor product
+    vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo unknown)"
+    product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+    case "$vendor" in
+        QEMU|VMware*|innotek*|Xen|Microsoft\ Corporation\ Virtual*) : ;;
+        *) : ;;
+    esac
+    case "$vendor $product" in
+        *QEMU*|*VMware*|*VirtualBox*|*KVM*)
+            die "virtual machine detected ($vendor $product) — thermaltune calibrates real hardware" ;;
+    esac
+    [ -d /sys/devices/system/cpu/cpu0/cpufreq ] || die "no cpufreq sysfs interface found"
+    if [ -e /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then
+        CAP_MODE=pct
+    else
+        CAP_MODE=freq
+    fi
+    ORIG_MAX_FREQ="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)" || die "cannot read scaling_max_freq"
+}
+
+cpu_driver() {
+    if [ -e /sys/devices/system/cpu/intel_pstate/status ]; then
+        echo "intel_pstate ($(cat /sys/devices/system/cpu/intel_pstate/status))"
+    elif [ -e /sys/devices/system/cpu/intel_pstate ]; then
+        echo "intel_pstate (passive)"
+    elif ls /sys/devices/system/cpu/cpu0/cpufreq/*amd_pstate* >/dev/null 2>&1; then
+        echo "amd_pstate"
+    else
+        echo "acpi-cpufreq"
+    fi
+}
+
+find_pkg_temp() {
+    local z t h f
+    for z in /sys/class/thermal/thermal_zone*; do
+        t="$(cat "$z/type" 2>/dev/null)" || continue
+        case "$t" in
+            *pkg*|*x86_pkg*) echo "$z/temp"; return 0 ;;
+        esac
+    done
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "coretemp" ] || continue
+        for f in "$h"/temp*_label; do
+            [ -e "$f" ] || continue
+            if grep -qi package "$f" 2>/dev/null; then echo "${f%_label}_input"; return 0; fi
+        done
+    done
+    for h in /sys/class/hwmon/hwmon*; do
+        case "$(cat "$h/name" 2>/dev/null)" in
+            k10temp|zenpower) echo "$h/temp1_input"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+find_pkg_crit() {
+    local z t h f best=""
+    for z in /sys/class/thermal/thermal_zone*; do
+        t="$(cat "$z/type" 2>/dev/null)" || continue
+        case "$t" in
+            *pkg*|*x86_pkg*)
+                [ -e "$z/crit" ] && { echo "$z/crit"; return 0; }
+                ;;
+        esac
+    done
+    for h in /sys/class/hwmon/hwmon*; do
+        case "$(cat "$h/name" 2>/dev/null)" in
+            coretemp|k10temp|zenpower)
+                for f in "$h"/temp*_crit; do
+                    [ -e "$f" ] || continue
+                    [ -z "$best" ] && best="$f"
+                done
+                ;;
+        esac
+    done
+    [ -n "$best" ] && { echo "$best"; return 0; }
+    return 1
+}
+
+pkg_temp_c() {
+    awk '{printf "%.1f", $1/1000}' "$PKG_TEMP_FILE" 2>/dev/null || echo "NA"
+}
+
+derive_target_temp() {
+    local crit_c=100
+    if [ -n "$PKG_CRIT_FILE" ] && [ -r "$PKG_CRIT_FILE" ]; then
+        crit_c="$(awk '{printf "%d", $1/1000}' "$PKG_CRIT_FILE")"
+    fi
+    local t=$((crit_c - 15))
+    [ "$t" -gt 85 ] && t=85
+    [ "$t" -lt 70 ] && t=70
+    echo "$t"
+}
+
+power_state() {
+    local a
+    for a in /sys/class/power_supply/A*; do
+        [ -e "$a/online" ] || continue
+        [ "$(cat "$a/online" 2>/dev/null)" = "1" ] && { echo "ac"; return 0; }
+    done
+    echo "battery"
+}
+
+battery_pct() {
+    local b best=""
+    for b in /sys/class/power_supply/BAT*; do
+        [ -e "$b/capacity" ] || continue
+        best="$(cat "$b/capacity" 2>/dev/null)"
+        [ -n "$best" ] && break
+    done
+    echo "${best:--1}"
+}
+
+rapl_ok() { [ -r /sys/class/powercap/intel-rapl:0/energy_uj ]; }
+
+# ---------------------------------------------------------------- cap I/O ----
+
+get_cap_pct() {
+    if [ "$CAP_MODE" = "pct" ]; then
+        cat /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || echo 100
+    else
+        local cur
+        cur="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)" || { echo 100; return; }
+        echo $(( (100 * cur + ORIG_MAX_FREQ / 2) / ORIG_MAX_FREQ ))
+    fi
+}
+
+set_cap_pct() {
+    local pct=$1 f c
+    if [ "$CAP_MODE" = "pct" ]; then
+        echo "$pct" > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || die "cannot write max_perf_pct"
+    else
+        f=$((ORIG_MAX_FREQ * pct / 100))
+        for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            echo "$f" > "$c" 2>/dev/null || true
+        done
+    fi
+}
+
+snapshot_cap() {
+    # echoes restore instructions as flat lines: pct=<v> or cpuN=<freq>
+    if [ "$CAP_MODE" = "pct" ]; then
+        echo "pct=$(get_cap_pct)"
+    else
+        local c
+        for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            echo "$(basename "$(dirname "$c")")=$(cat "$c" 2>/dev/null)"
+        done
+    fi
+}
+
+restore_cap() {
+    local line k v c
+    while IFS='=' read -r k v; do
+        [ -n "${k:-}" ] || continue
+        if [ "$k" = "pct" ]; then
+            echo "$v" > /sys/devices/system/cpu/intel_pstate/max_perf_pct 2>/dev/null || true
+        else
+            echo "$v" > "/sys/devices/system/cpu/$k/cpufreq/scaling_max_freq" 2>/dev/null || true
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- UI layer ---
+
+ui_detect() {
+    if [ "$(id -u)" = "0" ] && [ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+        UI_TOOL="tty"; return
+    fi
+    if command -v kdialog >/dev/null 2>&1; then UI_TOOL="kdialog"
+    elif command -v zenity >/dev/null 2>&1; then UI_TOOL="zenity"
+    else UI_TOOL="tty"; fi
+}
+
+ui_ask() { # title msg -> exit 0 = yes
+    case "$UI_TOOL" in
+        kdialog) kdialog --title "$1" --yesno "$2" ;;
+        zenity)  zenity --question --title="$1" --text="$2" --width=520 ;;
+        *)       local a; printf '%s\n%s\n[y/N] ' "$1" "$2" >&2; read -r a; [ "$a" = "y" ] || [ "$a" = "Y" ] ;;
+    esac
+}
+
+ui_info() { # title msg
+    case "$UI_TOOL" in
+        kdialog) kdialog --title "$1" --msgbox "$2" ;;
+        zenity)  zenity --info --title="$1" --text="$2" --width=520 ;;
+        *)       printf '%s\n%s\n' "$1" "$2" >&2 ;;
+    esac
+}
+
+detect_heavy_apps() {
+    ps -eo pcpu,comm --sort=-pcpu 2>/dev/null \
+        | awk 'NR>1 && $1+0>=15 && $2 !~ /^(ps|thermaltune|stress-ng|sudo|bash)$/ {print $2}' \
+        | sort -u | head -5
+}
+
+est_minutes() { # $1 = n_steps -> typical minutes
+    local n=${1:-8}
+    echo $(( n * (LOAD_S + SETTLE_S + 30) / 60 ))
+}
+est_minutes_worst() {
+    local n=${1:-12}
+    echo $(( n * (LOAD_S + SETTLE_S + COOL_CAP_S + 15) / 60 ))
+}
+
+# ------------------------------------------------------------- measurement ---
+
+avg_freq() { awk '{s+=$1;n++} END{if(n>0) printf "%.0f", s/n/1000; else print 0}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null; }
+min_freq() { awk 'BEGIN{m=0} {if(m==0||$1<m)m=$1} END{if(m>0) printf "%.0f", m/1000}' /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null; }
+
+start_sampler() { # $1 csv path ; sets SAMPLER_PID
+    local csv=$1
+    (
+        while :; do
+            if [ "${RAPL_AVAILABLE:-0}" = "1" ]; then
+                printf '%s,%s,%s,%s,%s\n' "$SECONDS" "$(pkg_temp_c)" "$(avg_freq)" "$(min_freq)" "$(cat /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null)" >> "$csv"
+            else
+                printf '%s,%s,%s,%s\n' "$SECONDS" "$(pkg_temp_c)" "$(avg_freq)" "$(min_freq)" >> "$csv"
+            fi
+            sleep "$SAMPLE_EVERY"
+        done
+    ) &
+    SAMPLER_PID=$!
+}
+
+stop_sampler() {
+    [ -n "${SAMPLER_PID:-}" ] || return 0
+    kill "$SAMPLER_PID" 2>/dev/null || true
+    wait "$SAMPLER_PID" 2>/dev/null || true
+    SAMPLER_PID=""
+}
+
+# analyze_csv FILE CAPF TARGET  -> emits KEY=VALUE env on stdout
+# stable criterion: floor-dips <= 5% of samples, sustained clock >= 90% of cap,
+# peak temp <= target. CSV: t,temp_c,avg_freq_mhz,min_freq_mhz[,energy_uj]
+analyze_csv() {
+    local file=$1 capf=$2 tgt=$3
+    local rows sk maxe="0"
+    rows="$(wc -l < "$file" 2>/dev/null)" || rows=0
+    if [ "${rows:-0}" -lt 6 ]; then
+        echo "STABLE=0 EMPTY=1"
+        return 0
+    fi
+    sk=$(( rows * 2 / 5 )); [ "$sk" -lt 2 ] && sk=2
+    [ -r /sys/class/powercap/intel-rapl:0/max_energy_range_uj ] && maxe="$(cat /sys/class/powercap/intel-rapl:0/max_energy_range_uj)"
+    awk -F, -v cap="$capf" -v tgt="$tgt" -v sk="$sk" -v maxe="$maxe" '
+        NR > sk {
+            n++; ts += $2; tf += $3; tm += $4; if ($2 > mt) mt = $2;
+            if ($3 < cap * 0.5) dips++;
+            if (NF >= 5 && prv != "") {
+                e = $5; if (e < prv) e += maxe + 1;
+                es += e - prv; dt += $1 - prvt;
+            }
+            prv = $5; prvt = $1;
+        }
+        END {
+            if (n == 0) { printf "STABLE=0 EMPTY=1\n"; exit }
+            dfrac = dips * 100.0 / n;
+            ratio = int(100 * tf / n / cap);
+            pwr = "NA";
+            if (dt > 0) pwr = sprintf("%.1f", es / 1000000 / dt);
+            st = (dfrac <= 5 && ratio >= 90 && mt <= tgt) ? 1 : 0;
+            printf "STABLE=%d N=%d STEADY_T=%.1f PEAK_T=%.1f STEADY_F=%.0f MIN_F=%.0f DIPS_FRAC=%.1f RATIO=%d PWR_W=%s\n", st, n, ts/n, mt, tf/n, tm/n, dfrac, ratio, pwr;
+        }
+    ' "$file"
+}
+
+# shellcheck disable=SC2120
+parse_ops_per_s() { # stress.log -> ops/s or NA
+    local line
+    line="$(awk '$4=="cpu"{print; exit}' "$1" 2>/dev/null)"
+    [ -n "$line" ] || { echo "NA"; return 0; }
+    eval "$(echo "${line#*cpu}" | awk '{n=0; for(i=1;i<=NF;i++){x=$i; gsub(/[^0-9.]/,"",x); if(x!="" && x+0==x){v[++n]=x}} if(n>=2) printf "OPS=%s REAL=%s", v[1], v[2]}')"
+    if [ -n "${OPS:-}" ] && [ -n "${REAL:-}" ]; then
+        awk -v o="$OPS" -v r="$REAL" 'BEGIN{ if (r+0 > 0) printf "%.0f", o/r; else print "NA" }'
+    else
+        echo "NA"
+    fi
+}
+
+parse_tstat() { # tstat file capf -> real avg MHz or NA
+    [ -s "$1" ] || { echo "NA"; return 0; }
+    tail -n 10 "$1" 2>/dev/null | awk -v hi="$(($2 + 100))" '
+        { gsub(/[^0-9 ]/," ",$0); n=split($0,a," ");
+          for(i=1;i<=n;i++) if(a[i]>=200 && a[i]<=hi){s+=a[i];c++} }
+        END{ if(c>0) printf "%.0f", s/c; else print "NA" }'
+}
+
+getkey() { # file key -> value or empty
+    awk -F= -v k="$2" '$1==k{print $2; exit}' "$1" 2>/dev/null
+}
+
+cool_wait() { # target C
+    local i t
+    for i in $(seq 1 $(( COOL_CAP_S / 5 ))); do
+        t="$(pkg_temp_c)"
+        if awk -v t="$t" -v c="$1" 'BEGIN{exit !(t+0 <= c+0)}'; then return 0; fi
+        sleep 5
+    done
+}
+
+# run_step LABEL PCT OUTDIR  -> writes $OUTDIR/$LABEL.env ; human summary to stdout
+run_step() {
+    local label=$1 pct=$2 out=$3
+    local capf csv ts idle_t real_clk ops
+    set_cap_pct "$pct"
+    if [ "$CAP_MODE" = "pct" ]; then
+        capf=$(( ORIG_MAX_FREQ * pct / 100 ))
+    else
+        capf="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"
+    fi
+    if [ -n "${IDLE_REF:-}" ]; then
+        cool_wait "$IDLE_REF"
+    fi
+    sleep "$SETTLE_S"
+    idle_t="$(pkg_temp_c)"
+    : "${IDLE_REF:=$idle_t}"
+
+    csv="$out/$label.csv"; ts="$out/$label.tstat"
+    rm -f "$csv" "$ts" "$out/$label.stress.log"
+    start_sampler "$csv"
+
+    echo "[load] $label — cap ${pct}% (~$((capf/1000)) MHz), full all-core load for ${LOAD_S}s ..."
+    stress-ng --cpu "$(nproc)" --cpu-method matrixprod --timeout "${LOAD_S}s" --metrics-brief > "$out/$label.stress.log" 2>&1 &
+    local lpid=$!
+    if command -v turbostat >/dev/null 2>&1; then
+        sleep $(( LOAD_S - 25 ))
+        timeout 25 turbostat --quiet --interval 5 --num_iterations 3 --show Bzy_MHz --out "$ts" >/dev/null 2>&1
+    fi
+    wait "$lpid"
+    stop_sampler
+
+    eval "$(analyze_csv "$csv" "$capf" "${TARGET_TEMP:-85}")"
+    real_clk="$(parse_tstat "$ts" "$capf")"
+    ops="$(parse_ops_per_s "$out/$label.stress.log")"
+
+    {
+        echo "label=$label"
+        echo "pct=$pct"
+        echo "cap_mhz=$capf"
+        echo "idle_temp_c=$idle_t"
+        echo "steady_temp_c=${STEADY_T:-NA}"
+        echo "peak_temp_c=${PEAK_T:-NA}"
+        echo "steady_clock_mhz=${STEADY_F:-NA}"
+        echo "dips_frac=${DIPS_FRAC:-NA}"
+        echo "clock_ratio_pct=${RATIO:-NA}"
+        echo "power_w=${PWR_W:-NA}"
+        echo "real_clock_mhz=$real_clk"
+        echo "ops_per_s=$ops"
+        echo "stable=${STABLE:-0}"
+    } > "$out/$label.env"
+
+    if [ "${EMPTY:-0}" = "1" ]; then
+        echo "[step] $label — FAILED to sample (no data)"
+    else
+        echo "[step] $label — cap ${pct}%: steady ${STEADY_F} MHz (${RATIO}% of cap), peak ${PEAK_T}C, dips ${DIPS_FRAC}%, ${ops} ops/s -> $( [ "${STABLE:-0}" = 1 ] && echo STABLE || echo UNSTABLE )"
+    fi
+}
+
+# ------------------------------------------------------------ persistence ---
+
+do_install_persistence() {
+    [ "$(id -u)" = 0 ] || die "install-persistence needs root"
+    install -Dm755 "$SELF" "$BIN"
+    cat > "$UNIT" <<UNIT
+[Unit]
+Description=Apply thermaltune calibrated CPU cap
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    cat > "$HOOK" <<HOOK
+#!/bin/bash
+# thermaltune resume hook — re-apply the calibrated cap after suspend
+if [ "\$1" = post ]; then
+    $BIN apply >/dev/null 2>&1 || true
+fi
+HOOK
+    chmod 755 "$HOOK"
+    systemctl daemon-reload
+    systemctl enable thermaltune.service >/dev/null 2>&1
+    log "persistence installed: unit + resume hook enabled (script at $BIN)"
+}
+
+cmd_install_persistence() {
+    do_install_persistence
+}
+
+cmd_uninstall() {
+    [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" uninstall
+    systemctl disable --now thermaltune.service 2>/dev/null || true
+    rm -f "$UNIT" "$HOOK" "$CONF" "$BIN"
+    systemctl daemon-reload 2>/dev/null || true
+    set_cap_pct 100
+    log "uninstalled: unit, resume hook, config and $BIN removed; cap restored to 100%"
+    log "(the repository copy at $(dirname "$SELF") was left untouched)"
+}
+
+# ---------------------------------------------------------------- commands ---
+
+cmd_apply() {
+    [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" apply
+    [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
+    # shellcheck disable=SC1090
+    local pct
+    pct="$(getkey "$CONF" CAP_PCT)"
+    [ -n "$pct" ] || die "corrupt config: $CONF"
+    set_cap_pct "$pct"
+    echo "cap applied: max ${pct}%"
+}
+
+cmd_off() {
+    [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" off
+    set_cap_pct 100
+    echo "cap removed: full turbo (temporary — re-applied at next boot or resume)"
+}
+
+cmd_status() {
+    local driver cur conf_pct="" peak="" date="" pstate=""
+    driver="$(cpu_driver)"
+    cur="$(get_cap_pct)"
+    echo "thermaltune $VERSION — status"
+    echo "  driver:          $driver (cap mode: $CAP_MODE)"
+    echo "  current cap:     ${cur}% (~$(( ORIG_MAX_FREQ * cur / 100 / 1000 )) MHz)"
+    if [ -f "$CONF" ]; then
+        conf_pct="$(getkey "$CONF" CAP_PCT)"
+        peak="$(getkey "$CONF" CALIBRATED_PEAK_C)"
+        date="$(getkey "$CONF" CALIBRATED_DATE)"
+        pstate="$(getkey "$CONF" POWER_STATE)"
+        echo "  saved cap:       ${conf_pct}%  (calibrated $date, peak ${peak}C, on $pstate)"
+    else
+        echo "  saved cap:       none (run: thermaltune calibrate)"
+    fi
+    local ustate
+    ustate="$(systemctl is-enabled thermaltune.service 2>/dev/null || true)"
+    [ -z "$ustate" ] && ustate="not-installed"
+    echo "  persistence:     unit $ustate, hook $([ -e "$HOOK" ] && echo present || echo absent)"
+    if [ -n "$PKG_TEMP_FILE" ]; then
+        echo "  package temp:    $(pkg_temp_c) C   clock now: $(avg_freq) MHz"
+    fi
+    if [ -n "$pstate" ] && [ "$pstate" != "$(power_state)" ]; then
+        warn "calibrated on $pstate but currently on $(power_state) — the flat point may differ"
+    fi
+}
+
+cmd_doctor() {
+    local driver cur crit_c target dep
+    echo "thermaltune $VERSION — doctor"
+    echo "== platform"
+    echo "  machine:  $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+    echo "  kernel:   $(uname -r)  ($(uname -m))"
+    echo "  cpu:      $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || echo '?')"
+    echo "  driver:   $(cpu_driver)"
+    if [ "$CAP_MODE" = "pct" ]; then
+        echo "  cap knob: intel_pstate max_perf_pct [supported]"
+    else
+        echo "  cap knob: per-cpu scaling_max_freq [supported, less elegant]"
+    fi
+    echo "== thermals"
+    if [ -n "$PKG_TEMP_FILE" ]; then
+        local tsrc
+        tsrc="$(basename "$(dirname "$PKG_TEMP_FILE")")"
+        if [ -e "$(dirname "$PKG_TEMP_FILE")/type" ]; then
+            tsrc="$(cat "$(dirname "$PKG_TEMP_FILE")/type")"
+        fi
+        echo "  package temp now: $(pkg_temp_c) C  ($tsrc)"
+    else
+        echo "  [fail] no CPU package temperature sensor found"
+    fi
+    if [ -n "$PKG_CRIT_FILE" ] && [ -r "$PKG_CRIT_FILE" ]; then
+        crit_c="$(awk '{printf "%d", $1/1000}' "$PKG_CRIT_FILE")"
+    else
+        crit_c=100
+    fi
+    target="$(derive_target_temp)"
+    echo "  hardware crit:    ${crit_c} C -> default target ${target} C"
+    echo "== frequency policy"
+    cur="$(get_cap_pct)"
+    echo "  current cap: ${cur}%   governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+    echo "  EPP: $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo n/a)"
+    if [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+        echo "  turbo disabled: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)"
+    fi
+    echo "== daemons that may fight the cap"
+    local d name bad=0
+    for d in tlp thermald auto-cpufreq cpupower; do
+        if systemctl is-enabled "$d.service" >/dev/null 2>&1 || pgrep -x "$d" >/dev/null 2>&1; then
+            echo "  [warn] $d is active — it may rewrite frequency policy and override the cap"
+            bad=1
+        fi
+    done
+    if systemctl is-active power-profiles-daemon.service >/dev/null 2>&1 || systemctl is-enabled power-profiles-daemon.service >/dev/null 2>&1; then
+        echo "  [ok] power-profiles-daemon active (normal; does not touch max_perf_pct)"
+    fi
+    [ "$bad" = 1 ] && echo "  note: thermaltune does not disable these; see README (conflicts section)"
+    echo "== dependencies"
+    for dep in stress-ng turbostat kdialog zenity; do
+        command -v "$dep" >/dev/null 2>&1 && echo "  [ok] $dep" || echo "  [missing] $dep"
+    done
+    rapl_ok && echo "  [ok] RAPL power meter readable" || echo "  [warn] RAPL power meter not readable without root (power reporting disabled for non-root runs)"
+    echo "== persistence"
+    systemctl is-enabled thermaltune.service >/dev/null 2>&1 \
+        && echo "  [ok] unit enabled" || echo "  [info] unit not installed (installed automatically by calibrate)"
+    [ -f "$CONF" ] && echo "  [ok] saved calibration exists ($(getkey "$CONF" CALIBRATED_DATE))" \
+                   || echo "  [info] no calibration yet"
+    echo "== sensors inventory"
+    for h in /sys/class/hwmon/hwmon*; do
+        echo "  $(cat "$h/name" 2>/dev/null): $(ls "$h" 2>/dev/null | grep -c 'temp.*_input') temp inputs"
+    done
+}
+
+cmd_check() {
+    [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
+    local saved_pct saved_peak cal_date cur
+    saved_pct="$(getkey "$CONF" CAP_PCT)"
+    saved_peak="$(getkey "$CONF" CALIBRATED_PEAK_C)"
+    cal_date="$(getkey "$CONF" CALIBRATED_DATE)"
+    cur="$(get_cap_pct)"
+    if [ "$cur" != "$saved_pct" ]; then
+        if [ "$(id -u)" = 0 ]; then
+            log "current cap ($cur%) differs from saved ($saved_pct%) — applying saved cap for the check"
+            set_cap_pct "$saved_pct"
+        else
+            warn "cap currently differs from saved (ran 'off'?) — checking the CURRENT cap; use sudo for the saved one"
+        fi
+    fi
+    log "check: ${CHECK_LOAD_S}s full all-core load at current settings (calibrated $cal_date, baseline peak ${saved_peak}C)"
+    log "do not use the machine during the check."
+    local out="/tmp/thermaltune-check.$$"
+    mkdir -p "$out"
+    if [ "$(id -u)" = 0 ]; then out="$RUNS_ROOT/checks"; mkdir -p "$out"; fi
+    local csv="$out/check.csv"
+    rm -f "$csv"
+    if rapl_ok; then RAPL_AVAILABLE=1; fi
+    sleep 30
+    start_sampler "$csv"
+    stress-ng --cpu "$(nproc)" --cpu-method matrixprod --timeout "${CHECK_LOAD_S}s" --metrics-brief > "$out/check.stress.log" 2>&1 &
+    local lpid=$!
+    wait "$lpid"
+    stop_sampler
+    local capf
+    if [ "$CAP_MODE" = "pct" ]; then capf=$(( ORIG_MAX_FREQ * $(get_cap_pct) / 100 )); else capf="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"; fi
+    eval "$(analyze_csv "$csv" "$capf" "$(( saved_peak + 6 ))")"
+    local verdict="PASS"
+    [ "${STABLE:-0}" = "1" ] || verdict="FAIL"
+    echo "check result: $verdict"
+    echo "  peak temp:   ${PEAK_T} C (baseline +6 margin)"
+    echo "  floor dips:  ${DIPS_FRAC:-NA}% (limit 8%)"
+    echo "  clock:       ${STEADY_F:-NA} MHz (${RATIO:-NA}% of cap)"
+    if [ "$verdict" = "PASS" ]; then
+        log "saved cap is still valid for current conditions"
+    else
+        log "conditions changed (season, dust, cooling) — re-run: thermaltune calibrate"
+    fi
+    rm -rf "$out"
+    [ "$verdict" = "PASS" ]
+}
+
+# --------------------------------------------------------------- calibrate ---
+
+write_conf() { # pct target pstate peak clock ops
+    {
+        echo "# thermaltune state — written by calibrate"
+        echo "CAP_PCT=$1"
+        echo "TARGET_TEMP=$2"
+        echo "POWER_STATE=$3"
+        echo "CALIBRATED_DATE=$(date +%Y-%m-%dT%H:%M:%S)"
+        echo "CALIBRATED_PEAK_C=$4"
+        echo "CALIBRATED_CLOCK_MHZ=$5"
+        echo "CALIBRATED_OPS_S=$6"
+        echo "VERSION=$VERSION"
+    } > "$CONF"
+    chmod 644 "$CONF"
+}
+
+cmd_calibrate() {
+    # ---- user phase: consent, deps, preflight ----
+    detect_platform
+    PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU package temperature sensor found"
+    PKG_CRIT_FILE="$(find_pkg_crit || true)"
+    ui_detect
+    if [ "$(id -u)" = "0" ]; then
+        log "running as root — popups disabled, terminal prompts only (recommended: run WITHOUT sudo; sudo is used internally)"
+        UI_TOOL="tty"
+    fi
+
+    local driver missing=() dep
+    driver="$(cpu_driver)"
+    log "driver: $driver (cap mode: $CAP_MODE)"
+    for dep in stress-ng turbostat; do
+        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+    done
+    if [ "$UI_TOOL" != "tty" ] && ! command -v zenity >/dev/null 2>&1 && ! command -v kdialog >/dev/null 2>&1; then
+        missing+=("zenity")
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        if ui_ask "thermaltune — install dependencies" \
+            "thermaltune needs these packages to calibrate:
+  ${missing[*]}
+
+Install them now with pacman (you will be asked for your password)?"; then
+            sudo pacman -S --needed --noconfirm "${missing[@]}" || die "dependency installation failed"
+        else
+            die "dependencies missing: ${missing[*]}"
+        fi
+    fi
+
+    # battery pre-check
+    local pstate batt
+    pstate="$(power_state)"
+    batt="$(battery_pct)"
+    if [ "$pstate" = "battery" ]; then
+        if [ "$batt" -ge 0 ] && [ "$batt" -lt 50 ]; then
+            die "battery at ${batt}% — plug in AC before calibrating"
+        fi
+        warn "running on battery (${batt}%) — results may differ on AC; AC calibration is recommended"
+    fi
+
+    [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
+
+    # time estimate + heavy apps warning
+    local heavy list_text est est_worst nsteps
+    if [ "$PROFILE" = "quick" ]; then
+        nsteps=4
+    else
+        nsteps=12
+    fi
+    est="$(est_minutes "$nsteps")"
+    est_worst="$(est_minutes_worst "$nsteps")"
+    heavy="$(detect_heavy_apps)"
+    list_text="none detected"
+    [ -n "$heavy" ] && list_text="$heavy"
+
+    local msg="thermaltune will calibrate your CPU's highest stable frequency cap.
+
+What happens:
+  * several full all-core load tests (your CPU will run hot, fans loud)
+  * the best cap is applied and survives reboot/suspend
+Typical duration: ~${est} min (at most ~${est_worst} min).
+Target: peak temperature stays <= ${TARGET_TEMP} C.
+
+Detected heavy apps — please close them first:
+  $list_text
+
+Start calibration now?"
+    if [ "$UI_TOOL" = "tty" ]; then
+        printf '%s\n' "$msg" >&2
+        ui_ask "thermaltune" "Start calibration now?" || die "aborted by user"
+    else
+        ui_ask "thermaltune" "$msg" || die "aborted by user"
+    fi
+
+    # ---- hand off to root phase ----
+    printf 'PROFILE=%s\nTARGET_TEMP=%s\n' "$PROFILE" "$TARGET_TEMP" > "$ANSWERS"
+    chmod 600 "$ANSWERS"
+    log "starting privileged phase (you may be asked for your sudo password)..."
+    local rc=0
+    sudo -p "[thermaltune] password: " bash "$SELF" --_internal calibrate "$ANSWERS" || rc=$?
+    rm -f "$ANSWERS"
+    if [ "$rc" != "0" ]; then
+        die "calibration failed (exit $rc) — previous cap was restored"
+    fi
+
+    # ---- user phase: summary popup ----
+    local res="$RUNS_ROOT/latest/result.env"
+    [ -f "$res" ] || die "calibration finished but no result file found"
+    local rpct rpeak rclock rops rdeg
+    rpct="$(getkey "$res" RESULT_PCT)"
+    rpeak="$(getkey "$res" RESULT_PEAK_C)"
+    rclock="$(getkey "$res" RESULT_CLOCK_MHZ)"
+    rops="$(getkey "$res" RESULT_OPS_S)"
+    rdeg="$(getkey "$res" RESULT_DEGRADED)"
+    local summary="Calibration complete.
+
+Saved cap: ${rpct}% (~$(( ORIG_MAX_FREQ * rpct / 100 / 1000 )) MHz)
+Sustained clock: ${rclock} MHz   Peak temp: ${rpeak} C
+Throughput: ${rops} ops/s
+Cap survives reboot and suspend. Full details: $RUNS_ROOT/latest"
+    [ "$rdeg" = "1" ] && summary="$summary
+
+NOTE: no fully stable point was found — the chosen cap is the best
+available; your machine may be dust-limited. See doctor."
+    ui_info "thermaltune — done" "$summary"
+    echo "$summary"
+}
+
+cmd_internal_calibrate() { # $1 = answers file ; runs as root
+    [ "$(id -u)" = 0 ] || die "internal phase must run as root"
+    local answers=$1
+    [ -f "$answers" ] || die "answers file missing"
+    while IFS='=' read -r k v; do
+        case "$k" in
+            PROFILE) PROFILE="$v" ;;
+            TARGET_TEMP) TARGET_TEMP="$v" ;;
+        esac
+    done < "$answers"
+
+    detect_platform
+    PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU temperature sensor"
+    PKG_CRIT_FILE="$(find_pkg_crit || true)"
+    RAPL_AVAILABLE=0; rapl_ok && RAPL_AVAILABLE=1
+
+    local run_dir="$RUNS_ROOT/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$run_dir"
+
+    # record + trap restore
+    local orig_snapshot
+    orig_snapshot="$(snapshot_cap)"
+    restore_cap_fn() { printf '%s\n' "$orig_snapshot" | restore_cap; }
+    trap 'restore_cap_fn; echo "[thermaltune] interrupted — previous cap restored" >&2; exit 130' INT TERM
+
+    # idle sanity pre-check
+    echo "[precheck] settling ${SETTLE_S}s before baseline ..."
+    sleep "$SETTLE_S"
+    local idle_now
+    idle_now="$(pkg_temp_c)"
+    local idle_limit
+    idle_limit="$(awk -v t="$TARGET_TEMP" 'BEGIN{printf "%d", t-10}')"
+    if awk -v t="$idle_now" -v c="$idle_limit" 'BEGIN{exit !(t+0 > c+0)}'; then
+        die "idle package temp ${idle_now}C is above ${idle_limit}C with no load — your cooling is failing (dust, dead fan, bad mount). Clean it first; calibration would produce garbage."
+    fi
+    echo "[precheck] idle ${idle_now}C — OK (target ${TARGET_TEMP}C)"
+
+    local candidates
+    if [ "$PROFILE" = "quick" ]; then candidates="70 55 45"; else candidates="85 73 63 55 47"; fi
+    local nsteps
+    if [ "$PROFILE" = "quick" ]; then nsteps=4; else nsteps=12; fi
+    echo "[plan] profile=$PROFILE load=${LOAD_S}s/step settle=${SETTLE_S}s candidates: $candidates"
+    echo "[plan] duration: typically ~$(est_minutes 8) min, at most ~$(est_minutes_worst "$nsteps") min"
+
+    # ---- baseline ----
+    run_step "baseline-100" 100 "$run_dir"
+    local base_env="$run_dir/baseline-100.env"
+    if [ "$(getkey "$base_env" stable)" = "1" ]; then
+        echo "[result] uncapped CPU already runs flat within target — no cap needed on this machine/workload"
+        local bp=$(getkey "$base_env" peak_temp_c) bc=$(getkey "$base_env" steady_clock_mhz) bo=$(getkey "$base_env" ops_per_s) bpw=$(getkey "$base_env" power_w)
+        printf 'RESULT_PCT=100\nRESULT_PEAK_C=%s\nRESULT_CLOCK_MHZ=%s\nRESULT_OPS_S=%s\nRESULT_POWER_W=%s\nRESULT_DEGRADED=0\nRESULT_BASELINE_STABLE=1\nRESULT_TARGET=%s\nRESULT_DATE=%s\nRESULT_POWER_STATE=%s\nRUN_DIR=%s\n' \
+            "$bp" "$bc" "$bo" "$bpw" "$TARGET_TEMP" "$(date +%Y-%m-%dT%H:%M:%S)" "$(power_state)" "$run_dir" > "$run_dir/result.env"
+        chmod 644 "$run_dir"/*.env "$run_dir"/*.csv "$run_dir"/*.tstat "$run_dir"/*.log 2>/dev/null
+        ln -sfn "$run_dir" "$RUNS_ROOT/latest"
+        trap - INT TERM
+        set_cap_pct 100
+        echo "[done] nothing to apply — full speed is already stable"
+        return 0
+    fi
+
+    # ---- sweep (descending; stop at first stable) ----
+    local p cand="" last_unstable=100 r envf
+    for p in $candidates; do
+        run_step "sweep-$p" "$p" "$run_dir"
+        envf="$run_dir/sweep-$p.env"
+        if [ "$(getkey "$envf" stable)" = "1" ]; then cand="$p"; break; fi
+        last_unstable="$p"
+    done
+
+    local degraded=0
+    if [ -z "$cand" ]; then
+        degraded=1
+        cand="$p"
+        warn "no stable point found across the whole sweep — using the lowest tested cap ($cand%)"
+    else
+        # ---- refinement between last_unstable and candidate ----
+        local it=0 mid
+        while [ $(( last_unstable - cand )) -ge 8 ] && [ "$it" -lt 2 ]; do
+            mid=$(( (last_unstable + cand) / 2 ))
+            run_step "refine-$mid" "$mid" "$run_dir"
+            if [ "$(getkey "$run_dir/refine-$mid.env" stable)" = "1" ]; then
+                cand="$mid"
+            else
+                last_unstable="$mid"
+            fi
+            it=$(( it + 1 ))
+        done
+        # ---- confirm: try pushing the cap UP while it stays flat ----
+        local tries=0 hi
+        while [ "$tries" -lt 2 ]; do
+            hi=$(( cand + 7 )); [ "$hi" -gt 100 ] && hi=100
+            [ "$hi" -eq "$cand" ] && break
+            run_step "confirm-high-$hi" "$hi" "$run_dir"
+            if [ "$(getkey "$run_dir/confirm-high-$hi.env" stable)" = "1" ]; then
+                cand="$hi"; tries=$(( tries + 1 ))
+            else
+                break
+            fi
+        done
+        # ---- final confirmation of the candidate ----
+        local ok=0 attempt newcand="$cand"
+        for attempt in 1 2; do
+            run_step "confirm-final" "$newcand" "$run_dir"
+            if [ "$(getkey "$run_dir/confirm-final.env" stable)" = "1" ]; then ok=1; break; fi
+            newcand=$(( newcand - 7 )); [ "$newcand" -lt 30 ] && newcand=30
+        done
+        cand="$newcand"
+        [ "$ok" = 1 ] || warn "final confirmation unstable — using last candidate with reduced confidence"
+    fi
+
+    # ---- apply + persist ----
+    local fenv="$run_dir/confirm-final.env"
+    [ -f "$fenv" ] || fenv="$run_dir/sweep-$cand.env"
+    local fpeak fclock fops fpw
+    fpeak="$(getkey "$fenv" peak_temp_c)"; fclock="$(getkey "$fenv" steady_clock_mhz)"
+    fops="$(getkey "$fenv" ops_per_s)"; fpw="$(getkey "$fenv" power_w)"
+    set_cap_pct "$cand"
+    write_conf "$cand" "$TARGET_TEMP" "$(power_state)" "$fpeak" "$fclock" "$fops"
+    do_install_persistence
+
+    printf 'RESULT_PCT=%s\nRESULT_PEAK_C=%s\nRESULT_CLOCK_MHZ=%s\nRESULT_OPS_S=%s\nRESULT_POWER_W=%s\nRESULT_DEGRADED=%s\nRESULT_BASELINE_STABLE=0\nRESULT_TARGET=%s\nRESULT_DATE=%s\nRESULT_POWER_STATE=%s\nRUN_DIR=%s\n' \
+        "$cand" "$fpeak" "$fclock" "$fops" "$fpw" "$degraded" "$TARGET_TEMP" "$(date +%Y-%m-%dT%H:%M:%S)" "$(power_state)" "$run_dir" > "$run_dir/result.env"
+    chmod 644 "$run_dir"/*.env "$run_dir"/*.csv "$run_dir"/*.tstat "$run_dir"/*.log 2>/dev/null
+    ln -sfn "$run_dir" "$RUNS_ROOT/latest"
+
+    # ---- summary table ----
+    {
+        echo "thermaltune calibration summary — $(date)"
+        echo "profile=$PROFILE target=${TARGET_TEMP}C power=$(power_state)"
+        echo
+        printf '%-18s %5s %8s %8s %9s %7s %7s %9s %8s\n' STEP PCT TEMP PEAK CLOCK DIPS RATIO PWR OPS/S
+        for e in "$run_dir"/*.env; do
+            [ "$(basename "$e")" = "result.env" ] && continue
+            printf '%-18s %5s %8s %8s %9s %7s %7s %9s %8s\n' \
+                "$(getkey "$e" label)" "$(getkey "$e" pct)" \
+                "$(getkey "$e" steady_temp_c)" "$(getkey "$e" peak_temp_c)" \
+                "$(getkey "$e" steady_clock_mhz)" "$(getkey "$e" dips_frac)" \
+                "$(getkey "$e" clock_ratio_pct)" "$(getkey "$e" power_w)" \
+                "$(getkey "$e" ops_per_s)"
+        done
+    } | tee "$run_dir/summary.txt"
+    chmod 644 "$run_dir/summary.txt"
+
+    trap - INT TERM
+    echo "[done] cap ${cand}% applied, saved and persisted"
+}
+
+# ---------------------------------------------------------------- selftest ---
+
+cmd_selftest() {
+    local dir="${1:-/tmp/opencode/thermal}"
+    [ -d "$dir" ] || die "selftest data dir not found: $dir (recorded data from the machine thermaltune was developed on)"
+    # label -> cap MHz mapping for the recorded runs
+    declare -A CAPMAP=( [uncapped]=3600 [cap2.8GHz]=2800 [cap2.4GHz]=2400 [cap1.0GHz]=1000 [cap2.2GHz]=2200 [cap2.0GHz]=2000 )
+    declare -A EXPECT=( [uncapped]=0 [cap2.8GHz]=0 [cap2.4GHz]=0 [cap1.0GHz]=1 [cap2.2GHz]=0 [cap2.0GHz]=1 )
+    local pass=0 fail=0 f label cap out got exp
+    echo "thermaltune selftest — validating analyzer against recorded calibration data in $dir"
+    for f in "$dir"/*.csv; do
+        [ -e "$f" ] || continue
+        label="$(basename "$f" .csv)"
+        [ -n "${CAPMAP[$label]+x}" ] || { echo "  [skip] $label (no cap mapping)"; continue; }
+        cap="${CAPMAP[$label]}"; exp="${EXPECT[$label]}"
+        out="$(analyze_csv "$f" "$cap" 85)"
+        got="$(echo "$out" | sed -n 's/^STABLE=\([0-9]\).*/\1/p')"
+        if [ "$got" = "$exp" ]; then
+            echo "  [pass] $label: stable=$got (expected $exp) — $(echo "$out" | sed -n 's/^/         /p' | tr '\n' ' ')"
+            pass=$(( pass + 1 ))
+        else
+            echo "  [FAIL] $label: stable=$got (expected $exp) — $out"
+            fail=$(( fail + 1 ))
+        fi
+    done
+    echo "selftest: $pass passed, $fail failed"
+    [ "$fail" -eq 0 ]
+}
+
+# -------------------------------------------------------------------- main ---
+
+usage() {
+    sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'
+    echo
+    echo "full help is in the header of $SELF and in README.md"
+}
+
+main() {
+    # global flags
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --profile) PROFILE="$2"; shift 2 ;;
+            --target-temp) TARGET_TEMP="$2"; shift 2 ;;
+            --load-seconds) LOAD_S="$2"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            --version|version) echo "thermaltune $VERSION"; exit 0 ;;
+            *) break ;;
+        esac
+    done
+    [ $# -gt 0 ] || { usage; exit 0; }
+
+    PKG_TEMP_FILE="$(find_pkg_temp 2>/dev/null || true)"
+    PKG_CRIT_FILE="$(find_pkg_crit 2>/dev/null || true)"
+    if [ -e /sys/devices/system/cpu/intel_pstate/max_perf_pct ]; then CAP_MODE=pct; fi
+    ORIG_MAX_FREQ="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo 0)"
+
+    case "$1" in
+        calibrate) shift; cmd_calibrate "$@" ;;
+        check) shift; cmd_check "$@" ;;
+        status) cmd_status ;;
+        doctor) cmd_doctor ;;
+        apply|on) cmd_apply ;;
+        off) cmd_off ;;
+        uninstall) cmd_uninstall ;;
+        install-persistence) cmd_install_persistence ;;
+        --selftest) shift; cmd_selftest "$@" ;;
+        --_internal)
+            shift
+            case "${1:-}" in
+                calibrate) shift; cmd_internal_calibrate "$@" ;;
+                *) die "unknown internal command" ;;
+            esac
+            ;;
+        *) die "unknown command: $1 (see --help)" ;;
+    esac
+}
+
+main "$@"
