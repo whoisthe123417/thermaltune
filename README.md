@@ -4,9 +4,11 @@
 
 ```
 thermaltune calibrate     # ~40 min, finds + applies + persists the sweet spot
-thermaltune check         # 4 min, verifies the saved cap is still valid
+thermaltune calibrate --mode adaptive   # bursts at full speed, clamped when hot
+thermaltune mode adaptive # switch modes later (uses the saved calibration)
+thermaltune check         # ~5 min, verifies the saved calibration still holds
 thermaltune status        # what's currently applied
-thermaltune doctor        # full system audit
+thermaltune doctor        # full system audit (incl. adaptive readiness)
 thermaltune off / apply   # temporary full speed / re-apply
 thermaltune uninstall     # remove everything, restore full speed
 ```
@@ -67,6 +69,42 @@ guessing.
 calibrated baseline (seasonal drift, dust, different power state → it tells
 you to recalibrate).
 
+## Adaptive mode (thermald or ttc)
+
+A fixed cap keeps the CPU at the sweet spot all the time — even when you're
+just typing. Adaptive mode does the smarter thing: **full speed in bursts,
+automatic clamping only when the CPU actually gets hot.** Same peak
+temperature protection, more responsiveness.
+
+```
+thermaltune calibrate --mode adaptive
+thermaltune mode adaptive   # or cap — later, from the saved calibration
+```
+
+Two interchangeable engines:
+
+- **thermald** — the standard Linux thermal daemon. thermaltune writes
+  `/etc/thermald/thermal-conf.xml` (a passive trip at the calibrated target
+  on the `x86_pkg_temp` zone, driving `rapl_controller` when RAPL is
+  readable, otherwise the Processor T-state device), enables the daemon,
+  then **empirically verifies** it actually clamps: full-speed load runs
+  whose peak must land within target + 3 °C, with the target stepping down
+  and retrying (max 3 attempts) otherwise. If it can't engage on your
+  hardware, everything is rolled back and thermaltune points you at
+  `--engine ttc`.
+- **ttc** — thermaltune's own controller (systemd service
+  `thermaltune-adaptive.service`): polls package temperature every 2 s,
+  lowers the proven cap 5% at temp ≥ target, raises it 2% at temp ≤
+  target − 6 °C (max one change per 12 s, floor 35%). It re-reads its target
+  from `/etc/thermaltune.conf` every cycle, so `thermaltune mode` switches
+  take effect immediately.
+
+The verification loop is the important part. On the dev machine there is no
+`rapl_controller` sysfs device, and a controller that fails to engage would
+otherwise silently do nothing while looking installed. thermaltune never
+ships an unverified controller: if the engine doesn't demonstrably clamp, you
+get a full rollback, not a false sense of safety.
+
 ## Design choices worth knowing
 
 - **Two-phase privilege**: popups and consent run as *your user*; only the
@@ -97,6 +135,8 @@ you to recalibrate).
 | Component | Status |
 |---|---|
 | `intel_pstate` (active) — `max_perf_pct` | **hardware-validated** (Ice Lake i5-1035G1) |
+| adaptive mode — `ttc` engine | implemented, hardware acceptance run pending |
+| adaptive mode — `thermald` engine | implemented (man-page-verified config), acceptance run pending |
 | `amd_pstate` — per-CPU `scaling_max_freq` | implemented per spec, **untested** |
 | `acpi-cpufreq` — per-CPU `scaling_max_freq` | implemented per spec, **untested** |
 | RAPL power reporting | optional; silently skipped if unavailable |
@@ -117,8 +157,8 @@ Uninstall: `sudo thermaltune uninstall`.
 
 ## Roadmap
 
-- thermald adaptive mode (free bursts, clamps when hot) — v2, after it's
-  validated on the dev machine
+- Adaptive mode (thermald + ttc engines) — **shipped in 0.2.0**; hardware
+  acceptance run pending on the dev machine
 - Per-power-state calibration (AC vs battery)
 - Alternative calibration workloads (`--workload`)
 - P/E-core aware caps for hybrid Intel CPUs

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 — 2026-11-14
+
+Adaptive mode.
+
+- New operating mode: full speed in bursts, automatically clamped near the
+  temperature target (`calibrate --mode adaptive`, `mode [cap|adaptive]`)
+- Two engines: `thermald` (config written, engagement empirically verified,
+  automatic rollback with a ttc suggestion if it can't clamp) and `ttc`
+  (`thermaltune-adaptive.service` controller on the proven cap knob,
+  2 s polling, reads its target from the config every cycle)
+- Verification loop: repeated full-speed runs, target steps down until the
+  engine demonstrably clamps within target + 3 °C
+- Mode-aware `apply`, `off`, `check`, `status`, `doctor` (adaptive readiness
+  section) and `uninstall` (thermald config backup/restore)
+- thermald config backed up to `thermal-conf.xml.pre-thermaltune` and
+  restored on mode switch/uninstall; adaptive systemd unit for ttc
+- `--mode` / `--engine` flags, engine-choice popup, mode-aware consent copy
+
 ## 0.1.0 — 2026-11-14
 
 Initial release.

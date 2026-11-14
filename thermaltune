@@ -7,25 +7,34 @@
 # leaving the CPU uncapped, because uncapped machines oscillate between bursts
 # and deep thermal throttling.
 #
+# Two operating modes:
+#   cap        constant cap at the calibrated sweet spot (default)
+#   adaptive   full speed in bursts, automatically clamped when the CPU gets
+#              hot — via thermald (standard daemon) or ttc (thermaltune's
+#              own temperature controller on the cap knob)
+#
 # Provenance: AI-authored (GLM via OpenCode), hardware-validated on a
 # Surface Laptop Go 1 (i5-1035G1, CachyOS). See docs/validation.md.
 # License: MIT — see LICENSE.
 #
 # Usage: thermaltune <command> [options]
-#   calibrate            Find + apply + persist the sweet-spot cap (sudo handled)
-#   check                Verify the saved cap still runs flat (~4 min)
+#   calibrate            Find + apply + persist (cap or adaptive; sudo handled)
+#   check                Verify the saved calibration still holds (~5 min)
 #   status               Current state summary
-#   doctor               System audit: drivers, sensors, conflicts, deps
-#   apply|on             Re-apply the saved cap (used by systemd units)
-#   off                  Temporarily remove the cap (until next boot/resume)
+#   doctor               System audit: drivers, sensors, conflicts, adaptive readiness
+#   apply|on             Re-apply the saved calibration (used by systemd units)
+#   off                  Temporarily remove all clamping (until next boot/resume)
+#   mode [cap|adaptive]  Switch operating mode (uses saved values)
 #   uninstall            Remove persistence and restore full speed
-#   install-persistence  (Re)install the systemd unit + resume hook
+#   install-persistence  (Re)install the systemd unit(s) + resume hook
 #   --selftest [dir]     Validate the analyzer against recorded calibration data
 #
 # Options:
 #   --profile quick|thorough   Sweep depth (default: thorough)
 #   --target-temp N            Peak package temp target °C (default: derived, <=85)
 #   --load-seconds N           Per-step sustained load seconds (default: 210)
+#   --mode cap|adaptive        Operating mode for calibrate (default: cap)
+#   --engine thermald|ttc      Adaptive engine for calibrate (default: asked)
 #
 # Design notes:
 #   * Two-phase privilege: popups/consent run as YOUR user; only the
@@ -37,7 +46,7 @@
 set -u
 umask 022
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -46,6 +55,10 @@ HOOK="/usr/lib/systemd/system-sleep/thermaltune-resume"
 BIN="/usr/local/bin/thermaltune"
 RUNS_ROOT="/var/lib/thermaltune/runs"
 ANSWERS="${TMPDIR:-/tmp}/thermaltune-answers.$$.env"
+THERMALD_CONF="/etc/thermald/thermal-conf.xml"
+THERMALD_CONF_BAK="/etc/thermald/thermal-conf.xml.pre-thermaltune"
+THERMALD_DROPIN="/etc/systemd/system/thermald.service.d/thermaltune.conf"
+AUNIT="/etc/systemd/system/thermaltune-adaptive.service"
 
 LOAD_S=210
 SETTLE_S=75
@@ -56,6 +69,8 @@ DEFAULT_TARGET=85
 
 PROFILE="thorough"
 TARGET_TEMP=""
+MODE="cap"
+ENGINE=""
 CAP_MODE="pct"
 ORIG_MAX_FREQ=0
 UI_TOOL="tty"
@@ -260,6 +275,40 @@ ui_info() { # title msg
     esac
 }
 
+# ask which adaptive engine to use; echoes thermald|ttc or fails
+choose_engine() {
+    local msg="Adaptive mode needs a temperature controller. Two engines:
+
+  thermald — the standard Linux thermal daemon. thermaltune writes
+      its config and verifies it actually clamps (some laptops lack
+      what thermald needs).
+  ttc — thermaltune's own controller, driving the same proven
+      frequency-cap knob up and down. Works wherever cap mode works."
+    local choice=""
+    case "$UI_TOOL" in
+        kdialog)
+            choice="$(kdialog --title 'thermaltune — engine' --radiolist "$msg" \
+                thermald 'thermald (standard daemon)' off \
+                ttc 'ttc (thermaltune controller)' off --separate-output 2>/dev/null)"
+            ;;
+        zenity)
+            choice="$(zenity --list --radiolist --title='thermaltune — engine' --text="$msg" \
+                --column='' --column='Engine' --column='Description' \
+                TRUE thermald 'standard thermal daemon' \
+                FALSE ttc 'thermaltune own controller' --width=560 --height=340 2>/dev/null)"
+            ;;
+        *)
+            printf '%s\n\n  1) thermald — standard Linux thermal daemon\n  2) ttc — thermaltune own controller (always works with the cap knob)\n[1/2] ' "$msg" >&2
+            read -r choice
+            ;;
+    esac
+    case "$choice" in
+        *ttc*) echo ttc ;;
+        *thermald*) echo thermald ;;
+        *) return 1 ;;
+    esac
+}
+
 detect_heavy_apps() {
     ps -eo pcpu,comm --sort=-pcpu 2>/dev/null \
         | awk 'NR>1 && $1+0>=15 && $2 !~ /^(ps|thermaltune|stress-ng|sudo|bash)$/ {print $2}' \
@@ -455,8 +504,25 @@ if [ "\$1" = post ]; then
 fi
 HOOK
     chmod 755 "$HOOK"
+    cat > "$AUNIT" <<AUNIT
+[Unit]
+Description=thermaltune adaptive temperature controller (ttc engine)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=$BIN --_internal adaptive-loop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+AUNIT
     systemctl daemon-reload
     systemctl enable thermaltune.service >/dev/null 2>&1
+    if [ "${ENGINE:-}" = "ttc" ]; then
+        systemctl enable thermaltune-adaptive.service >/dev/null 2>&1 || true
+    fi
     log "persistence installed: unit + resume hook enabled (script at $BIN)"
 }
 
@@ -467,10 +533,21 @@ cmd_install_persistence() {
 cmd_uninstall() {
     [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" uninstall
     systemctl disable --now thermaltune.service 2>/dev/null || true
-    rm -f "$UNIT" "$HOOK" "$CONF" "$BIN"
+    systemctl disable --now thermaltune-adaptive.service 2>/dev/null || true
+    rm -f "$UNIT" "$AUNIT" "$HOOK" "$CONF" "$BIN"
+    rm -f "$THERMALD_DROPIN"
+    if [ -f "$THERMALD_CONF_BAK" ]; then
+        cp -a "$THERMALD_CONF_BAK" "$THERMALD_CONF"
+        rm -f "$THERMALD_CONF_BAK"
+        log "restored previous thermald configuration"
+    else
+        rm -f "$THERMALD_CONF"
+    fi
+    systemctl try-restart thermald.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
     set_cap_pct 100
-    log "uninstalled: unit, resume hook, config and $BIN removed; cap restored to 100%"
+    log "uninstalled: units, resume hook, config and $BIN removed; cap restored to 100%"
+    log "note: the thermald package (if installed) was left in place — remove with 'pacman -R thermald' if unwanted"
     log "(the repository copy at $(dirname "$SELF") was left untouched)"
 }
 
@@ -479,22 +556,96 @@ cmd_uninstall() {
 cmd_apply() {
     [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" apply
     [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
-    # shellcheck disable=SC1090
-    local pct
+    local mode pct engine
+    mode="$(getkey "$CONF" MODE)"; [ -n "$mode" ] || mode=cap
     pct="$(getkey "$CONF" CAP_PCT)"
     [ -n "$pct" ] || die "corrupt config: $CONF"
     set_cap_pct "$pct"
-    echo "cap applied: max ${pct}%"
+    if [ "$mode" = "adaptive" ]; then
+        engine="$(getkey "$CONF" ADAPT_ENGINE)"
+        if [ "$engine" = "ttc" ]; then
+            systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
+            echo "adaptive applied: controller service active, ceiling ${pct}%"
+        else
+            systemctl enable --now thermald.service >/dev/null 2>&1 || true
+            systemctl restart thermald.service 2>/dev/null || true
+            echo "adaptive applied: thermald active with thermaltune target, ceiling ${pct}%"
+        fi
+    else
+        echo "cap applied: max ${pct}%"
+    fi
 }
 
 cmd_off() {
     [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" off
+    if [ "$(getkey "$CONF" MODE 2>/dev/null)" = "adaptive" ]; then
+        systemctl stop thermaltune-adaptive.service 2>/dev/null || true
+        systemctl stop thermald.service 2>/dev/null || true
+        echo "adaptive clamping off: full turbo (temporary — re-applied at next boot or resume)"
+    else
+        echo "cap removed: full turbo (temporary — re-applied at next boot or resume)"
+    fi
     set_cap_pct 100
-    echo "cap removed: full turbo (temporary — re-applied at next boot or resume)"
+}
+
+cmd_mode() { # [cap|adaptive] — switch operating mode using saved calibration
+    [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" mode "$@"
+    [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
+    local want cur engine target
+    cur="$(getkey "$CONF" MODE)"; [ -n "$cur" ] || cur=cap
+    want="${1:-}"
+    if [ -z "$want" ]; then
+        [ "$cur" = "cap" ] && want=adaptive || want=cap
+    fi
+    [ "$want" = "cap" ] || [ "$want" = "adaptive" ] || die "unknown mode: $want (cap|adaptive)"
+    if [ "$want" = "$cur" ]; then
+        echo "already in $want mode"
+        return 0
+    fi
+    if [ "$want" = "adaptive" ]; then
+        engine="$(getkey "$CONF" ADAPT_ENGINE)"
+        target="$(getkey "$CONF" ADAPT_TARGET)"
+        [ -n "$target" ] || target="$(getkey "$CONF" TARGET_TEMP)"
+        [ -n "$target" ] || die "no temperature target in $CONF — calibrate first"
+        if [ -z "$engine" ]; then
+            [ "$CAP_MODE" = "pct" ] || die "no adaptive engine for this driver — calibrate with: thermaltune calibrate --mode adaptive"
+            engine=ttc
+            log "no engine recorded (cap-mode calibration) — using ttc on the same cap knob"
+        fi
+        set_cap_pct 100
+        set_conf_key MODE adaptive
+        set_conf_key ADAPT_ENGINE "$engine"
+        set_conf_key ADAPT_TARGET "$target"
+        if [ "$engine" = "ttc" ]; then
+            do_install_persistence
+            systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
+            systemctl is-active thermaltune-adaptive.service >/dev/null 2>&1 \
+                || die "adaptive service failed to start — see: journalctl -u thermaltune-adaptive"
+            echo "adaptive mode active (engine: ttc, target ${target} C)"
+        else
+            local cdev
+            cdev="$(find_thermal_cdev 2>/dev/null || true)"
+            [ -n "$cdev" ] || die "no cooling device for the thermald engine — run: thermaltune calibrate --mode adaptive --engine ttc"
+            backup_thermald_conf
+            write_thermald_conf "$target" "$cdev"
+            systemctl enable --now thermald.service >/dev/null 2>&1 || true
+            systemctl restart thermald.service 2>/dev/null || true
+            echo "adaptive mode active (engine: thermald, target ${target} C)"
+        fi
+        log "note: 'mode' reuses the saved target without re-verification — for a verified target run: thermaltune calibrate --mode adaptive"
+    else
+        disable_adaptive_engines
+        set_conf_key MODE cap
+        local pct
+        pct="$(getkey "$CONF" CAP_PCT)"; [ -n "$pct" ] || pct=100
+        set_cap_pct "$pct"
+        echo "cap mode active: max ${pct}%"
+        log "note: thermald may still be running with its default configuration — 'systemctl disable --now thermald' if unwanted"
+    fi
 }
 
 cmd_status() {
-    local driver cur conf_pct="" peak="" date="" pstate=""
+    local driver cur conf_pct="" peak="" date="" pstate="" cmode="" cengine="" ctarget=""
     driver="$(cpu_driver)"
     cur="$(get_cap_pct)"
     echo "thermaltune $VERSION — status"
@@ -505,6 +656,18 @@ cmd_status() {
         peak="$(getkey "$CONF" CALIBRATED_PEAK_C)"
         date="$(getkey "$CONF" CALIBRATED_DATE)"
         pstate="$(getkey "$CONF" POWER_STATE)"
+        cmode="$(getkey "$CONF" MODE)"; [ -n "$cmode" ] || cmode=cap
+        echo "  mode:            $cmode"
+        if [ "$cmode" = "adaptive" ]; then
+            cengine="$(getkey "$CONF" ADAPT_ENGINE)"
+            ctarget="$(getkey "$CONF" ADAPT_TARGET)"
+            if [ "$cengine" = "ttc" ]; then
+                echo "  controller:      thermaltune-adaptive.service $(systemctl is-active thermaltune-adaptive.service 2>/dev/null || echo inactive)"
+            else
+                echo "  controller:      thermald.service $(systemctl is-active thermald.service 2>/dev/null || echo inactive)"
+            fi
+            echo "  target:          peak <= ${ctarget:-?} C"
+        fi
         echo "  saved cap:       ${conf_pct}%  (calibrated $date, peak ${peak}C, on $pstate)"
     else
         echo "  saved cap:       none (run: thermaltune calibrate)"
@@ -552,6 +715,24 @@ cmd_doctor() {
     fi
     target="$(derive_target_temp)"
     echo "  hardware crit:    ${crit_c} C -> default target ${target} C"
+    echo "== adaptive mode readiness"
+    local acdev
+    acdev="$(find_thermal_cdev 2>/dev/null || true)"
+    if [ -n "$acdev" ]; then
+        echo "  [ok] thermald engine possible (control device: $acdev)"
+    else
+        echo "  [warn] no cooling device thermald can drive — thermald engine cannot engage; use engine ttc"
+    fi
+    if command -v thermald >/dev/null 2>&1 || { command -v pacman >/dev/null 2>&1 && pacman -Q thermald >/dev/null 2>&1; }; then
+        echo "  [ok] thermald available"
+    else
+        echo "  [info] thermald not installed (adaptive calibrate installs it with your consent)"
+    fi
+    if [ "$CAP_MODE" = "pct" ]; then
+        echo "  [ok] ttc engine possible (intel_pstate max_perf_pct)"
+    else
+        echo "  [warn] ttc engine unavailable (needs intel_pstate active mode)"
+    fi
     echo "== frequency policy"
     cur="$(get_cap_pct)"
     echo "  current cap: ${cur}%   governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
@@ -560,11 +741,16 @@ cmd_doctor() {
         echo "  turbo disabled: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo)"
     fi
     echo "== daemons that may fight the cap"
-    local d name bad=0
+    local d name bad=0 conf_mode
+    conf_mode="$(getkey "$CONF" MODE 2>/dev/null || true)"
     for d in tlp thermald auto-cpufreq cpupower; do
         if systemctl is-enabled "$d.service" >/dev/null 2>&1 || pgrep -x "$d" >/dev/null 2>&1; then
-            echo "  [warn] $d is active — it may rewrite frequency policy and override the cap"
-            bad=1
+            if [ "$d" = "thermald" ] && [ "$conf_mode" = "adaptive" ]; then
+                echo "  [ok] thermald active (it is the configured adaptive engine)"
+            else
+                echo "  [warn] $d is active — it may rewrite frequency policy and override the cap"
+                bad=1
+            fi
         fi
     done
     if systemctl is-active power-profiles-daemon.service >/dev/null 2>&1 || systemctl is-enabled power-profiles-daemon.service >/dev/null 2>&1; then
@@ -589,6 +775,10 @@ cmd_doctor() {
 
 cmd_check() {
     [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
+    if [ "$(getkey "$CONF" MODE 2>/dev/null)" = "adaptive" ]; then
+        cmd_check_adaptive
+        return
+    fi
     local saved_pct saved_peak cal_date cur
     saved_pct="$(getkey "$CONF" CAP_PCT)"
     saved_peak="$(getkey "$CONF" CALIBRATED_PEAK_C)"
@@ -634,21 +824,76 @@ cmd_check() {
     [ "$verdict" = "PASS" ]
 }
 
+cmd_check_adaptive() { # verify the live engine holds within target (engine stays active)
+    local target engine
+    target="$(getkey "$CONF" ADAPT_TARGET)"; [ -n "$target" ] || target=85
+    engine="$(getkey "$CONF" ADAPT_ENGINE)"; [ -n "$engine" ] || engine=ttc
+    if [ "$engine" = "ttc" ] && ! systemctl is-active thermaltune-adaptive.service >/dev/null 2>&1; then
+        die "adaptive service is not running — run: thermaltune apply"
+    fi
+    if [ "$engine" = "thermald" ] && ! systemctl is-active thermald.service >/dev/null 2>&1; then
+        die "thermald is not running — run: thermaltune apply"
+    fi
+    log "adaptive check: ${CHECK_LOAD_S}s full all-core load — the $engine engine is LIVE during the check"
+    log "do not use the machine during the check."
+    local out
+    if [ "$(id -u)" = 0 ]; then out="$RUNS_ROOT/checks"; else out="/tmp/thermaltune-check.$$"; fi
+    mkdir -p "$out"
+    local csv="$out/check.csv"
+    rm -f "$csv"
+    if [ "$(id -u)" = 0 ] && rapl_ok; then RAPL_AVAILABLE=1; fi
+    sleep 30
+    start_sampler "$csv"
+    stress-ng --cpu "$(nproc)" --cpu-method matrixprod --timeout "${CHECK_LOAD_S}s" --metrics-brief > "$out/check.stress.log" 2>&1 &
+    local lpid=$!
+    wait "$lpid"
+    stop_sampler
+    eval "$(analyze_csv "$csv" "$ORIG_MAX_FREQ" "$target")"
+    local verdict="PASS"
+    if [ "${PEAK_T:-NA}" = "NA" ]; then
+        verdict="FAIL"
+    elif awk -v p="$PEAK_T" -v t="$target" 'BEGIN{exit !(p+0 > t+6)}'; then
+        verdict="FAIL"
+    fi
+    echo "adaptive check result: $verdict"
+    echo "  peak temp:   ${PEAK_T:-NA} C (target ${target} C, fail margin +6)"
+    echo "  steady temp: ${STEADY_T:-NA} C"
+    echo "  avg clock:   ${STEADY_F:-NA} MHz (engine modulates; dips are normal here)"
+    if [ "$verdict" = "PASS" ]; then
+        log "engine is holding within target"
+    else
+        log "engine overshoots the target — recalibrate: thermaltune calibrate --mode adaptive"
+    fi
+    rm -rf "$out"
+    [ "$verdict" = "PASS" ]
+}
+
 # --------------------------------------------------------------- calibrate ---
 
-write_conf() { # pct target pstate peak clock ops
+write_conf() { # mode pct target pstate peak clock ops adapt_target adapt_engine
     {
         echo "# thermaltune state — written by calibrate"
-        echo "CAP_PCT=$1"
-        echo "TARGET_TEMP=$2"
-        echo "POWER_STATE=$3"
+        echo "MODE=$1"
+        echo "CAP_PCT=$2"
+        echo "TARGET_TEMP=$3"
+        echo "POWER_STATE=$4"
         echo "CALIBRATED_DATE=$(date +%Y-%m-%dT%H:%M:%S)"
-        echo "CALIBRATED_PEAK_C=$4"
-        echo "CALIBRATED_CLOCK_MHZ=$5"
-        echo "CALIBRATED_OPS_S=$6"
+        echo "CALIBRATED_PEAK_C=$5"
+        echo "CALIBRATED_CLOCK_MHZ=$6"
+        echo "CALIBRATED_OPS_S=$7"
+        echo "ADAPT_TARGET=$8"
+        echo "ADAPT_ENGINE=$9"
         echo "VERSION=$VERSION"
     } > "$CONF"
     chmod 644 "$CONF"
+}
+
+set_conf_key() { # KEY VALUE — edit one key in CONF in place
+    if grep -q "^$1=" "$CONF" 2>/dev/null; then
+        sed -i "s|^$1=.*|$1=$2|" "$CONF"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$CONF"
+    fi
 }
 
 cmd_calibrate() {
@@ -662,12 +907,34 @@ cmd_calibrate() {
         UI_TOOL="tty"
     fi
 
+    # ---- mode / engine validation ----
+    if [ "$MODE" != "cap" ] && [ "$MODE" != "adaptive" ]; then
+        die "unknown mode: $MODE (use --mode cap|adaptive)"
+    fi
+    if [ "$MODE" = "adaptive" ] && [ -z "$ENGINE" ]; then
+        ENGINE="$(choose_engine)" || die "no engine selected — use: thermaltune calibrate --mode adaptive --engine ttc|thermald"
+    fi
+    if [ "$MODE" = "adaptive" ]; then
+        if [ "$ENGINE" != "thermald" ] && [ "$ENGINE" != "ttc" ]; then
+            die "unknown engine: $ENGINE (use --engine thermald|ttc)"
+        fi
+        if [ "$ENGINE" = "ttc" ] && [ "$CAP_MODE" != "pct" ]; then
+            die "the ttc engine needs intel_pstate in active mode (max_perf_pct) — not available on this driver"
+        fi
+        log "mode: adaptive (engine: $ENGINE)"
+    fi
+
     local driver missing=() dep
     driver="$(cpu_driver)"
     log "driver: $driver (cap mode: $CAP_MODE)"
     for dep in stress-ng turbostat; do
         command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
     done
+    if [ "$MODE" = "adaptive" ] && [ "$ENGINE" = "thermald" ]; then
+        if ! command -v thermald >/dev/null 2>&1 && ! { command -v pacman >/dev/null 2>&1 && pacman -Q thermald >/dev/null 2>&1; }; then
+            missing+=("thermald")
+        fi
+    fi
     if [ "$UI_TOOL" != "tty" ] && ! command -v zenity >/dev/null 2>&1 && ! command -v kdialog >/dev/null 2>&1; then
         missing+=("zenity")
     fi
@@ -709,7 +976,9 @@ Install them now with pacman (you will be asked for your password)?"; then
     list_text="none detected"
     [ -n "$heavy" ] && list_text="$heavy"
 
-    local msg="thermaltune will calibrate your CPU's highest stable frequency cap.
+    local msg
+    if [ "$MODE" = "cap" ]; then
+        msg="thermaltune will calibrate your CPU's highest stable frequency cap.
 
 What happens:
   * several full all-core load tests (your CPU will run hot, fans loud)
@@ -721,6 +990,21 @@ Detected heavy apps — please close them first:
   $list_text
 
 Start calibration now?"
+    else
+        msg="thermaltune will set up ADAPTIVE thermal management (engine: $ENGINE).
+
+What happens:
+  * a calibration of the temperature target: several full all-core
+    load runs (your CPU will run hot, fans loud)
+  * afterwards the engine stays active: full speed in bursts,
+    automatically clamped as the CPU approaches ${TARGET_TEMP} C
+Typical duration: ~${est} min (at most ~${est_worst} min).
+
+Detected heavy apps — please close them first:
+  $list_text
+
+Start calibration now?"
+    fi
     if [ "$UI_TOOL" = "tty" ]; then
         printf '%s\n' "$msg" >&2
         ui_ask "thermaltune" "Start calibration now?" || die "aborted by user"
@@ -729,7 +1013,7 @@ Start calibration now?"
     fi
 
     # ---- hand off to root phase ----
-    printf 'PROFILE=%s\nTARGET_TEMP=%s\n' "$PROFILE" "$TARGET_TEMP" > "$ANSWERS"
+    printf 'PROFILE=%s\nTARGET_TEMP=%s\nMODE=%s\nENGINE=%s\n' "$PROFILE" "$TARGET_TEMP" "$MODE" "$ENGINE" > "$ANSWERS"
     chmod 600 "$ANSWERS"
     log "starting privileged phase (you may be asked for your sudo password)..."
     local rc=0
@@ -742,22 +1026,34 @@ Start calibration now?"
     # ---- user phase: summary popup ----
     local res="$RUNS_ROOT/latest/result.env"
     [ -f "$res" ] || die "calibration finished but no result file found"
-    local rpct rpeak rclock rops rdeg
+    local rpct rpeak rclock rops rdeg rmode rengine rtarget
     rpct="$(getkey "$res" RESULT_PCT)"
     rpeak="$(getkey "$res" RESULT_PEAK_C)"
     rclock="$(getkey "$res" RESULT_CLOCK_MHZ)"
     rops="$(getkey "$res" RESULT_OPS_S)"
     rdeg="$(getkey "$res" RESULT_DEGRADED)"
-    local summary="Calibration complete.
+    rmode="$(getkey "$res" RESULT_MODE)"
+    rengine="$(getkey "$res" RESULT_ENGINE)"
+    rtarget="$(getkey "$res" RESULT_TARGET)"
+    local summary
+    if [ "$rmode" = "adaptive" ]; then
+        summary="Adaptive mode is now active.
+
+Engine: $rengine
+Target: peak temperature <= ${rtarget:-?} C (measured peak: ${rpeak} C)
+The controller survives reboot and suspend. Full details: $RUNS_ROOT/latest"
+    else
+        summary="Calibration complete.
 
 Saved cap: ${rpct}% (~$(( ORIG_MAX_FREQ * rpct / 100 / 1000 )) MHz)
 Sustained clock: ${rclock} MHz   Peak temp: ${rpeak} C
 Throughput: ${rops} ops/s
 Cap survives reboot and suspend. Full details: $RUNS_ROOT/latest"
-    [ "$rdeg" = "1" ] && summary="$summary
+        [ "$rdeg" = "1" ] && summary="$summary
 
 NOTE: no fully stable point was found — the chosen cap is the best
 available; your machine may be dust-limited. See doctor."
+    fi
     ui_info "thermaltune — done" "$summary"
     echo "$summary"
 }
@@ -770,6 +1066,8 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
         case "$k" in
             PROFILE) PROFILE="$v" ;;
             TARGET_TEMP) TARGET_TEMP="$v" ;;
+            MODE) MODE="$v" ;;
+            ENGINE) ENGINE="$v" ;;
         esac
     done < "$answers"
 
@@ -777,6 +1075,11 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
     PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU temperature sensor"
     PKG_CRIT_FILE="$(find_pkg_crit || true)"
     RAPL_AVAILABLE=0; rapl_ok && RAPL_AVAILABLE=1
+
+    if [ "$MODE" = "adaptive" ]; then
+        cmd_internal_adaptive_calibrate
+        return
+    fi
 
     local run_dir="$RUNS_ROOT/$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$run_dir"
@@ -812,6 +1115,8 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
     if [ "$(getkey "$base_env" stable)" = "1" ]; then
         echo "[result] uncapped CPU already runs flat within target — no cap needed on this machine/workload"
         local bp=$(getkey "$base_env" peak_temp_c) bc=$(getkey "$base_env" steady_clock_mhz) bo=$(getkey "$base_env" ops_per_s) bpw=$(getkey "$base_env" power_w)
+        write_conf cap 100 "$TARGET_TEMP" "$(power_state)" "$bp" "$bc" "$bo" "$TARGET_TEMP" ""
+        disable_adaptive_engines
         printf 'RESULT_PCT=100\nRESULT_PEAK_C=%s\nRESULT_CLOCK_MHZ=%s\nRESULT_OPS_S=%s\nRESULT_POWER_W=%s\nRESULT_DEGRADED=0\nRESULT_BASELINE_STABLE=1\nRESULT_TARGET=%s\nRESULT_DATE=%s\nRESULT_POWER_STATE=%s\nRUN_DIR=%s\n' \
             "$bp" "$bc" "$bo" "$bpw" "$TARGET_TEMP" "$(date +%Y-%m-%dT%H:%M:%S)" "$(power_state)" "$run_dir" > "$run_dir/result.env"
         chmod 644 "$run_dir"/*.env "$run_dir"/*.csv "$run_dir"/*.tstat "$run_dir"/*.log 2>/dev/null
@@ -879,7 +1184,8 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
     fpeak="$(getkey "$fenv" peak_temp_c)"; fclock="$(getkey "$fenv" steady_clock_mhz)"
     fops="$(getkey "$fenv" ops_per_s)"; fpw="$(getkey "$fenv" power_w)"
     set_cap_pct "$cand"
-    write_conf "$cand" "$TARGET_TEMP" "$(power_state)" "$fpeak" "$fclock" "$fops"
+    write_conf cap "$cand" "$TARGET_TEMP" "$(power_state)" "$fpeak" "$fclock" "$fops" "$TARGET_TEMP" ""
+    disable_adaptive_engines
     do_install_persistence
 
     printf 'RESULT_PCT=%s\nRESULT_PEAK_C=%s\nRESULT_CLOCK_MHZ=%s\nRESULT_OPS_S=%s\nRESULT_POWER_W=%s\nRESULT_DEGRADED=%s\nRESULT_BASELINE_STABLE=0\nRESULT_TARGET=%s\nRESULT_DATE=%s\nRESULT_POWER_STATE=%s\nRUN_DIR=%s\n' \
@@ -907,6 +1213,249 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
 
     trap - INT TERM
     echo "[done] cap ${cand}% applied, saved and persisted"
+}
+
+# ------------------------------------------------------------- adaptive mode --
+
+find_thermal_cdev() { # echo the best cooling device thermald can drive (root)
+    # thermald has built-in rapl_controller support: usable whenever RAPL is
+    # readable, even without a sysfs cooling device (our dev machine's case).
+    if [ -n "${RAPL_AVAILABLE:-}" ] && [ "$RAPL_AVAILABLE" = "1" ]; then
+        echo "rapl_controller"; return 0
+    fi
+    local d t
+    for d in /sys/class/thermal/cooling_device*; do
+        [ -e "$d" ] || continue
+        t="$(cat "$d/type" 2>/dev/null)" || continue
+        [ "$t" = "rapl_controller" ] && { echo "$t"; return 0; }
+    done
+    for d in /sys/class/thermal/cooling_device*; do
+        [ -e "$d" ] || continue
+        t="$(cat "$d/type" 2>/dev/null)" || continue
+        case "$t" in Processor|processor) echo "$t"; return 0 ;; esac
+    done
+    for d in /sys/class/thermal/cooling_device*; do
+        [ -e "$d" ] || continue
+        t="$(cat "$d/type" 2>/dev/null)" || continue
+        case "$t" in intel_powerclamp|TCC*) echo "$t"; return 0 ;; esac
+    done
+    return 1
+}
+
+write_thermald_conf() { # $1 = target C, $2 = cooling device type
+    local tgt=$1 cdev=$2
+    mkdir -p "$(dirname "$THERMALD_CONF")"
+    cat > "$THERMALD_CONF" <<XML
+<?xml version="1.0"?>
+<!-- Generated by thermaltune adaptive mode (target ${tgt}C).
+     Undo: thermaltune mode cap  (restores any previous config) -->
+<ThermalConfiguration>
+  <Platform>
+    <Name>thermaltune adaptive</Name>
+    <ProductName>*</ProductName>
+    <Preference>QUIET</Preference>
+    <ThermalZones>
+      <ThermalZone>
+        <Type>x86_pkg_temp</Type>
+        <TripPoints>
+          <TripPoint>
+            <SensorType>x86_pkg_temp</SensorType>
+            <Temperature>$(( tgt * 1000 ))</Temperature>
+            <type>passive</type>
+            <ControlType>SEQUENTIAL</ControlType>
+            <CoolingDevice>
+              <type>$cdev</type>
+            </CoolingDevice>
+          </TripPoint>
+        </TripPoints>
+      </ThermalZone>
+    </ThermalZones>
+XML
+    # PID tuning only makes sense for the Processor (T-state) device; the
+    # built-in rapl_controller has its own continuous control logic.
+    if [ "$cdev" = "Processor" ]; then
+        cat >> "$THERMALD_CONF" <<XML2
+    <CoolingDevices>
+      <CoolingDevice>
+        <Type>Processor</Type>
+        <PidControl>
+          <kp>0.0002</kp>
+          <kd>0</kd>
+          <ki>0</ki>
+        </PidControl>
+      </CoolingDevice>
+    </CoolingDevices>
+XML2
+    fi
+    printf '  </Platform>\n</ThermalConfiguration>\n' >> "$THERMALD_CONF"
+    chmod 644 "$THERMALD_CONF"
+}
+
+backup_thermald_conf() {
+    [ -f "$THERMALD_CONF" ] || return 0
+    [ -f "$THERMALD_CONF_BAK" ] && return 0
+    cp -a "$THERMALD_CONF" "$THERMALD_CONF_BAK"
+    log "backed up existing thermald config to $THERMALD_CONF_BAK"
+}
+
+disable_adaptive_engines() { # stop our controller, restore thermald pre-thermaltune state
+    systemctl disable --now thermaltune-adaptive.service 2>/dev/null || true
+    if [ -f "$THERMALD_CONF_BAK" ]; then
+        cp -a "$THERMALD_CONF_BAK" "$THERMALD_CONF"
+        rm -f "$THERMALD_CONF_BAK"
+        log "thermald configuration restored"
+    else
+        rm -f "$THERMALD_CONF"
+    fi
+    rm -f "$THERMALD_DROPIN"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl try-restart thermald.service 2>/dev/null || true
+}
+
+cmd_internal_adaptive_calibrate() {
+    [ "$(id -u)" = 0 ] || die "internal phase must run as root"
+    local run_dir="$RUNS_ROOT/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$run_dir"
+
+    local orig_snapshot
+    orig_snapshot="$(snapshot_cap)"
+    restore_cap_fn() { printf '%s\n' "$orig_snapshot" | restore_cap; }
+    trap 'restore_cap_fn; disable_adaptive_engines >/dev/null 2>&1; echo "[thermaltune] interrupted — previous cap restored, engines disabled" >&2; exit 130' INT TERM
+
+    [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
+    echo "[plan] adaptive calibration: engine=$ENGINE target=${TARGET_TEMP}C load=${LOAD_S}s/step"
+    set_cap_pct 100
+
+    local target="$TARGET_TEMP" cdev="" engaged=0 attempt peak
+
+    if [ "$ENGINE" = "thermald" ]; then
+        cdev="$(find_thermal_cdev || true)"
+        if [ -z "$cdev" ]; then
+            restore_cap_fn
+            trap - INT TERM
+            die "no cooling device thermald can drive — try: thermaltune calibrate --mode adaptive --engine ttc"
+        fi
+        echo "[thermald] control device: $cdev"
+        backup_thermald_conf
+        write_thermald_conf "$target" "$cdev"
+        systemctl unmask thermald.service >/dev/null 2>&1 || true
+        systemctl enable --now thermald.service >/dev/null 2>&1 || systemctl restart thermald.service 2>/dev/null || true
+        sleep 3
+        local jerr
+        jerr="$(journalctl -u thermald.service -n 30 --no-pager 2>/dev/null | grep -iE 'error|fatal|cannot' | head -3)"
+        [ -n "$jerr" ] && warn "thermald journal: $(echo "$jerr" | head -1)"
+        for attempt in 1 2 3; do
+            echo "[verify] run $attempt/3: full speed, thermald must clamp near ${target}C"
+            run_step "adaptive-verify-$attempt" 100 "$run_dir"
+            peak="$(getkey "$run_dir/adaptive-verify-$attempt.env" peak_temp_c)"
+            if awk -v p="$peak" -v t="$target" 'BEGIN{exit !(p+0 <= t+3)}'; then
+                engaged=1; break
+            fi
+            target=$(( target - 5 ))
+            echo "[verify] peak ${peak}C — lowering target to ${target}C and retrying"
+            write_thermald_conf "$target" "$cdev"
+            systemctl restart thermald.service 2>/dev/null || true
+        done
+        if [ "$engaged" != "1" ]; then
+            echo "[thermald] did not clamp within 3 verification runs — restoring previous state"
+            restore_cap_fn
+            disable_adaptive_engines
+            trap - INT TERM
+            die "thermald engine failed to engage on this machine — try: thermaltune calibrate --mode adaptive --engine ttc"
+        fi
+    else
+        echo "[ttc] installing controller (target ${target}C) ..."
+        write_conf adaptive 100 "$TARGET_TEMP" "$(power_state)" "" "" "" "$target" ttc
+        do_install_persistence
+        systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
+        sleep 3
+        systemctl is-active thermaltune-adaptive.service >/dev/null 2>&1 \
+            || { restore_cap_fn; disable_adaptive_engines; trap - INT TERM; die "adaptive service failed to start (see: journalctl -u thermaltune-adaptive)"; }
+        for attempt in 1 2 3; do
+            echo "[verify] run $attempt/3: full speed, controller must clamp near ${target}C"
+            run_step "adaptive-verify-$attempt" 100 "$run_dir"
+            peak="$(getkey "$run_dir/adaptive-verify-$attempt.env" peak_temp_c)"
+            if awk -v p="$peak" -v t="$target" 'BEGIN{exit !(p+0 <= t+3)}'; then
+                engaged=1; break
+            fi
+            target=$(( target - 5 ))
+            echo "[verify] peak ${peak}C — lowering target to ${target}C and retrying"
+            set_conf_key ADAPT_TARGET "$target"
+        done
+        if [ "$engaged" != "1" ]; then
+            echo "[ttc] did not clamp within 3 verification runs — rolling back"
+            restore_cap_fn
+            disable_adaptive_engines
+            trap - INT TERM
+            die "ttc engine failed to clamp on this machine — measurement data in $run_dir"
+        fi
+    fi
+
+    # ---- persist final adaptive state ----
+    local venv="$run_dir/adaptive-verify-$attempt.env"
+    local fpeak fclock fops fpw
+    fpeak="$(getkey "$venv" peak_temp_c)"; fclock="$(getkey "$venv" steady_clock_mhz)"
+    fops="$(getkey "$venv" ops_per_s)"; fpw="$(getkey "$venv" power_w)"
+    write_conf adaptive 100 "$TARGET_TEMP" "$(power_state)" "$fpeak" "$fclock" "$fops" "$target" "$ENGINE"
+    do_install_persistence
+
+    printf 'RESULT_MODE=adaptive\nRESULT_ENGINE=%s\nRESULT_PCT=100\nRESULT_TARGET=%s\nRESULT_PEAK_C=%s\nRESULT_CLOCK_MHZ=%s\nRESULT_OPS_S=%s\nRESULT_POWER_W=%s\nRESULT_ENGAGED=1\nRESULT_DEGRADED=0\nRESULT_DATE=%s\nRESULT_POWER_STATE=%s\nRUN_DIR=%s\n' \
+        "$ENGINE" "$target" "$fpeak" "$fclock" "$fops" "$fpw" "$(date +%Y-%m-%dT%H:%M:%S)" "$(power_state)" "$run_dir" > "$run_dir/result.env"
+    chmod 644 "$run_dir"/*.env "$run_dir"/*.csv "$run_dir"/*.tstat "$run_dir"/*.log 2>/dev/null
+    ln -sfn "$run_dir" "$RUNS_ROOT/latest"
+
+    {
+        echo "thermaltune adaptive calibration summary — $(date)"
+        echo "engine=$ENGINE target=${target}C power=$(power_state)"
+        echo
+        printf '%-22s %5s %8s %9s %8s\n' STEP PCT PEAK CLOCK OPS/S
+        for e in "$run_dir"/adaptive-verify-*.env; do
+            [ -e "$e" ] || continue
+            printf '%-22s %5s %8s %9s %8s\n' \
+                "$(getkey "$e" label)" "$(getkey "$e" pct)" \
+                "$(getkey "$e" peak_temp_c)" "$(getkey "$e" steady_clock_mhz)" \
+                "$(getkey "$e" ops_per_s)"
+        done
+    } | tee "$run_dir/summary.txt"
+    chmod 644 "$run_dir/summary.txt"
+
+    trap - INT TERM
+    echo "[done] adaptive mode active: engine=$ENGINE target=${target}C"
+}
+
+cmd_internal_adaptive_loop() { # ttc engine body — runs as a systemd service (root)
+    [ "$(id -u)" = 0 ] || die "adaptive-loop must run as root"
+    detect_platform
+    PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU temperature sensor found"
+    PKG_CRIT_FILE="$(find_pkg_crit || true)"
+    echo "[ttc] thermaltune adaptive controller active (poll 2s)"
+    local last_change=0 t target pct
+    while :; do
+        if [ "$(getkey "$CONF" MODE 2>/dev/null)" != "adaptive" ]; then
+            sleep 5; continue
+        fi
+        target="$(getkey "$CONF" ADAPT_TARGET 2>/dev/null)"
+        case "${target:-}" in ''|*[!0-9]*) target=85 ;; esac
+        t="$(pkg_temp_c)"
+        if [ "$SECONDS" -ge $(( last_change + 12 )) ]; then
+            pct="$(get_cap_pct)"
+            case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
+            if awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 >= T+0)}'; then
+                if [ "$pct" -gt 35 ]; then
+                    pct=$(( pct - 5 )); [ "$pct" -lt 35 ] && pct=35
+                    set_cap_pct "$pct"; last_change=$SECONDS
+                    echo "[ttc] hot ${t}C (target ${target}C) -> cap ${pct}%"
+                fi
+            elif awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 <= T-6)}'; then
+                if [ "$pct" -lt 100 ]; then
+                    pct=$(( pct + 2 )); [ "$pct" -gt 100 ] && pct=100
+                    set_cap_pct "$pct"; last_change=$SECONDS
+                    echo "[ttc] cool ${t}C (target $(( target - 6 ))C) -> cap ${pct}%"
+                fi
+            fi
+        fi
+        sleep 2
+    done
 }
 
 # ---------------------------------------------------------------- selftest ---
@@ -941,7 +1490,7 @@ cmd_selftest() {
 # -------------------------------------------------------------------- main ---
 
 usage() {
-    sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'
     echo
     echo "full help is in the header of $SELF and in README.md"
 }
@@ -953,6 +1502,8 @@ main() {
             --profile) PROFILE="$2"; shift 2 ;;
             --target-temp) TARGET_TEMP="$2"; shift 2 ;;
             --load-seconds) LOAD_S="$2"; shift 2 ;;
+            --mode) MODE="$2"; shift 2 ;;
+            --engine) ENGINE="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             --version|version) echo "thermaltune $VERSION"; exit 0 ;;
             *) break ;;
@@ -972,6 +1523,7 @@ main() {
         doctor) cmd_doctor ;;
         apply|on) cmd_apply ;;
         off) cmd_off ;;
+        mode) cmd_mode "$@" ;;
         uninstall) cmd_uninstall ;;
         install-persistence) cmd_install_persistence ;;
         --selftest) shift; cmd_selftest "$@" ;;
@@ -979,6 +1531,7 @@ main() {
             shift
             case "${1:-}" in
                 calibrate) shift; cmd_internal_calibrate "$@" ;;
+                adaptive-loop) cmd_internal_adaptive_loop ;;
                 *) die "unknown internal command" ;;
             esac
             ;;
