@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 — 2026-11-14
+
+- fix: kHz/MHz unit mismatch between the cap reference passed to the
+  analyzer and the sampler's frequency units made every real calibration
+  step look unstable (dips 100%, ratio 0) — the sweep degenerated to the
+  lowest tested cap. Found by the first real end-to-end run (battery,
+  Surface Laptop Go 1); the sweep data itself was correct and, with the
+  fix, correctly identifies 55% as the stable point.
+- selftest extended with the root-recorded RAPL data from that run
+  (5-column CSVs): now **12/12 passing** against both the manual harness
+  data and real thermaltune output.
+
 ## 0.2.0 — 2026-11-14
 
 Adaptive mode.

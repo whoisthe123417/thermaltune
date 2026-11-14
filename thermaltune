@@ -46,7 +46,7 @@
 set -u
 umask 022
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -425,10 +425,11 @@ run_step() {
     local label=$1 pct=$2 out=$3
     local capf csv ts idle_t real_clk ops
     set_cap_pct "$pct"
+    # cap reference in MHz to match the sampler's frequency units
     if [ "$CAP_MODE" = "pct" ]; then
-        capf=$(( ORIG_MAX_FREQ * pct / 100 ))
+        capf=$(( ORIG_MAX_FREQ * pct / 100 / 1000 ))
     else
-        capf="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"
+        capf=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) / 1000 ))
     fi
     if [ -n "${IDLE_REF:-}" ]; then
         cool_wait "$IDLE_REF"
@@ -441,7 +442,7 @@ run_step() {
     rm -f "$csv" "$ts" "$out/$label.stress.log"
     start_sampler "$csv"
 
-    echo "[load] $label — cap ${pct}% (~$((capf/1000)) MHz), full all-core load for ${LOAD_S}s ..."
+    echo "[load] $label — cap ${pct}% (~$capf MHz), full all-core load for ${LOAD_S}s ..."
     stress-ng --cpu "$(nproc)" --cpu-method matrixprod --timeout "${LOAD_S}s" --metrics-brief > "$out/$label.stress.log" 2>&1 &
     local lpid=$!
     if command -v turbostat >/dev/null 2>&1; then
@@ -807,7 +808,7 @@ cmd_check() {
     wait "$lpid"
     stop_sampler
     local capf
-    if [ "$CAP_MODE" = "pct" ]; then capf=$(( ORIG_MAX_FREQ * $(get_cap_pct) / 100 )); else capf="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"; fi
+    if [ "$CAP_MODE" = "pct" ]; then capf=$(( ORIG_MAX_FREQ * $(get_cap_pct) / 100 / 1000 )); else capf=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) / 1000 )); fi
     eval "$(analyze_csv "$csv" "$capf" "$(( saved_peak + 6 ))")"
     local verdict="PASS"
     [ "${STABLE:-0}" = "1" ] || verdict="FAIL"
@@ -848,7 +849,7 @@ cmd_check_adaptive() { # verify the live engine holds within target (engine stay
     local lpid=$!
     wait "$lpid"
     stop_sampler
-    eval "$(analyze_csv "$csv" "$ORIG_MAX_FREQ" "$target")"
+    eval "$(analyze_csv "$csv" "$(( ORIG_MAX_FREQ / 1000 ))" "$target")"
     local verdict="PASS"
     if [ "${PEAK_T:-NA}" = "NA" ]; then
         verdict="FAIL"
@@ -1464,8 +1465,12 @@ cmd_selftest() {
     local dir="${1:-/tmp/opencode/thermal}"
     [ -d "$dir" ] || die "selftest data dir not found: $dir (recorded data from the machine thermaltune was developed on)"
     # label -> cap MHz mapping for the recorded runs
-    declare -A CAPMAP=( [uncapped]=3600 [cap2.8GHz]=2800 [cap2.4GHz]=2400 [cap1.0GHz]=1000 [cap2.2GHz]=2200 [cap2.0GHz]=2000 )
-    declare -A EXPECT=( [uncapped]=0 [cap2.8GHz]=0 [cap2.4GHz]=0 [cap1.0GHz]=1 [cap2.2GHz]=0 [cap2.0GHz]=1 )
+    # (cap1.0GHz.. = manual harness runs; sweep-*/baseline-100 = real
+    #  thermaltune root runs with RAPL, recorded 2026-11-14)
+    declare -A CAPMAP=( [uncapped]=3600 [cap2.8GHz]=2800 [cap2.4GHz]=2400 [cap1.0GHz]=1000 [cap2.2GHz]=2200 [cap2.0GHz]=2000 \
+                        [baseline-100]=3600 [sweep-47]=1692 [sweep-55]=1980 [sweep-63]=2268 [sweep-73]=2628 [sweep-85]=3060 )
+    declare -A EXPECT=( [uncapped]=0 [cap2.8GHz]=0 [cap2.4GHz]=0 [cap1.0GHz]=1 [cap2.2GHz]=0 [cap2.0GHz]=1 \
+                        [baseline-100]=0 [sweep-47]=1 [sweep-55]=1 [sweep-63]=0 [sweep-73]=0 [sweep-85]=0 )
     local pass=0 fail=0 f label cap out got exp
     echo "thermaltune selftest — validating analyzer against recorded calibration data in $dir"
     for f in "$dir"/*.csv; do

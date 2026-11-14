@@ -58,3 +58,29 @@ must reproduce exactly these stability verdicts: unstable for uncapped,
 2.8 GHz, 2.4 GHz, 2.2 GHz; stable for 1.0 GHz and 2.0 GHz. Current status:
 **6/6 passing** (metrics reproduce the table above: steady temps, clocks and
 power match to the displayed precision).
+
+## First real end-to-end run (battery, 2026-11-14 23:10)
+
+The first full `thermaltune calibrate` run on this machine (on battery,
+target 85 °C, thorough profile) — 5-column CSVs with RAPL power:
+
+| Step | Cap | Peak | Steady clock | Power | Verdict (post-fix analyzer) |
+|---|---|---|---|---|---|
+| baseline-100 | 3600 MHz | 100 °C | 1796 MHz, 38% floor dips | 17.2 W | unstable |
+| sweep-85 | 3060 MHz | 100 °C | 1152 MHz, 64% dips | 13.1 W | unstable |
+| sweep-73 | 2628 MHz | 98 °C | 1200 MHz, 60% dips | 12.7 W | unstable |
+| sweep-63 | 2268 MHz | 87 °C | 2300 MHz flat | 18.4 W | unstable (temp only) |
+| **sweep-55** | **1980 MHz** | **77 °C** | **2000 MHz flat, 0 dips** | **14.4 W** | **stable** |
+| sweep-47 | 1692 MHz | 71 °C | 1700 MHz flat | 11.3 W | stable |
+
+Two results from this run:
+
+1. **A real bug was caught** (the reason acceptance runs exist): the cap
+   reference was computed in kHz while the sampler records MHz, so every
+   step looked 100% dipped / 0% ratio and the sweep degenerated to the
+   lowest cap (47%, "degraded"). The measurement data itself was correct.
+   Fixed in 0.2.1; the analyzer now classifies all six steps exactly as the
+   table above.
+2. The sweep independently rediscovered the manually-found flat point:
+   **55% ≈ 2.0 GHz, flat, peak 77 °C on battery** — matching the AC ground
+   truth (peak 80 °C) within measurement noise.
