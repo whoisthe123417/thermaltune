@@ -45,6 +45,7 @@ UNIT="/etc/systemd/system/thermaltune.service"
 HOOK="/usr/lib/systemd/system-sleep/thermaltune-resume"
 BIN="/usr/local/bin/thermaltune"
 RUNS_ROOT="/var/lib/thermaltune/runs"
+ANSWERS="${TMPDIR:-/tmp}/thermaltune-answers.$$.env"
 
 LOAD_S=210
 SETTLE_S=75
