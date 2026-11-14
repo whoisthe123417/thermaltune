@@ -19,6 +19,7 @@
 #
 # Usage: thermaltune <command> [options]
 #   calibrate            Find + apply + persist (cap or adaptive; sudo handled)
+#   calibrate --defer    Schedule the run for the next boot with AC (unattended)
 #   check                Verify the saved calibration still holds (~5 min)
 #   status               Current state summary
 #   doctor               System audit: drivers, sensors, conflicts, adaptive readiness
@@ -35,6 +36,7 @@
 #   --load-seconds N           Per-step sustained load seconds (default: 210)
 #   --mode cap|adaptive        Operating mode for calibrate (default: cap)
 #   --engine thermald|ttc      Adaptive engine for calibrate (default: asked)
+#   --defer                    Schedule calibrate for the next boot with AC power
 #
 # Design notes:
 #   * Two-phase privilege: popups/consent run as YOUR user; only the
@@ -46,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -59,6 +61,8 @@ THERMALD_CONF="/etc/thermald/thermal-conf.xml"
 THERMALD_CONF_BAK="/etc/thermald/thermal-conf.xml.pre-thermaltune"
 THERMALD_DROPIN="/etc/systemd/system/thermald.service.d/thermaltune.conf"
 AUNIT="/etc/systemd/system/thermaltune-adaptive.service"
+DEFER_UNIT="/etc/systemd/system/thermaltune-autocal.service"
+DEFER_ANSWERS="/var/lib/thermaltune/pending-answers.env"
 
 LOAD_S=210
 SETTLE_S=75
@@ -71,6 +75,7 @@ PROFILE="thorough"
 TARGET_TEMP=""
 MODE="cap"
 ENGINE=""
+DEFER="0"
 CAP_MODE="pct"
 ORIG_MAX_FREQ=0
 UI_TOOL="tty"
@@ -531,6 +536,34 @@ cmd_install_persistence() {
     do_install_persistence
 }
 
+cmd_internal_defer_calibration() { # install a one-shot boot-time calibration unit (root)
+    [ "$(id -u)" = 0 ] || die "internal phase must run as root"
+    [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
+    install -Dm755 "$SELF" "$BIN"
+    mkdir -p "$(dirname "$DEFER_ANSWERS")"
+    cat > "$DEFER_UNIT" <<UNIT
+[Unit]
+Description=thermaltune deferred calibration (runs once at next boot with AC power)
+After=multi-user.target thermaltune.service
+ConditionACPower=yes
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c 'printf "PROFILE=%s\\nTARGET_TEMP=%s\\nMODE=cap\\nENGINE=\\n" "$PROFILE" "$TARGET_TEMP" > $DEFER_ANSWERS'
+ExecStart=$BIN --_internal calibrate $DEFER_ANSWERS
+ExecStartPost=/bin/rm -f $DEFER_ANSWERS
+ExecStartPost=/usr/bin/systemctl disable thermaltune-autocal.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable thermaltune-autocal.service >/dev/null 2>&1 || true
+    log "deferred calibration scheduled: runs once at the next boot with AC power (profile: $PROFILE, target: ${TARGET_TEMP}C)"
+    log "watch progress: journalctl -u thermaltune-autocal -f"
+    log "cancel: sudo systemctl disable thermaltune-autocal.service"
+}
+
 cmd_uninstall() {
     [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" uninstall
     systemctl disable --now thermaltune.service 2>/dev/null || true
@@ -898,6 +931,18 @@ set_conf_key() { # KEY VALUE — edit one key in CONF in place
 }
 
 cmd_calibrate() {
+    # per-command flags (so "thermaltune calibrate --defer" works naturally)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --profile) PROFILE="$2"; shift 2 ;;
+            --target-temp) TARGET_TEMP="$2"; shift 2 ;;
+            --load-seconds) LOAD_S="$2"; shift 2 ;;
+            --mode) MODE="$2"; shift 2 ;;
+            --engine) ENGINE="$2"; shift 2 ;;
+            --defer) DEFER="1"; shift ;;
+            *) die "unknown calibrate option: $1 (see --help)" ;;
+        esac
+    done
     # ---- user phase: consent, deps, preflight ----
     detect_platform
     PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU package temperature sensor found"
@@ -964,15 +1009,48 @@ Install them now with pacman (you will be asked for your password)?"; then
 
     [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
 
-    # time estimate + heavy apps warning
-    local heavy list_text est est_worst nsteps
-    if [ "$PROFILE" = "quick" ]; then
-        nsteps=4
-    else
-        nsteps=12
-    fi
-    est="$(est_minutes "$nsteps")"
+    # time estimate (typical assumes the sweep stops early; worst counts every step)
+    local heavy list_text est est_worst nsteps ntyp
+    if [ "$PROFILE" = "quick" ]; then nsteps=4; ntyp=5; else nsteps=12; ntyp=8; fi
+    est="$(est_minutes "$ntyp")"
     est_worst="$(est_minutes_worst "$nsteps")"
+
+    if [ "$DEFER" = "1" ]; then
+        if [ "$MODE" != "cap" ]; then
+            die "deferred calibration supports cap mode only — enable adaptive afterwards with: thermaltune mode adaptive"
+        fi
+        local dmsg="thermaltune DEFERRED calibration (profile: $PROFILE)
+
+At your NEXT BOOT with AC power, thermaltune runs unattended:
+  * ~${est} min of full all-core CPU load, starting shortly after boot
+    (leave the machine alone while it runs)
+  * no popups — progress: journalctl -u thermaltune-autocal -f
+  * the found cap is applied and survives reboot/suspend
+  * runs once, then removes itself (retries at the next AC boot if it fails)
+Skipped checks: heavy apps (fresh boot), battery (AC required anyway).
+
+Schedule this?"
+        if [ "$UI_TOOL" = "tty" ]; then
+            printf '%s\n' "$dmsg" >&2
+            ui_ask "thermaltune" "Schedule deferred calibration?" || die "aborted by user"
+        else
+            ui_ask "thermaltune" "$dmsg" || die "aborted by user"
+        fi
+        log "scheduling deferred calibration (one sudo password needed)..."
+        local rc=0
+        sudo -p "[thermaltune] password: " bash "$SELF" --_internal defer-calibration || rc=$?
+        [ "$rc" = "0" ] || die "could not schedule the deferred calibration"
+        ui_info "thermaltune — scheduled" "Deferred calibration is scheduled.
+
+It runs automatically at your next boot with AC power (~${est} min of CPU load — leave the machine be).
+
+Watch:    journalctl -u thermaltune-autocal -f
+Cancel:   sudo systemctl disable thermaltune-autocal.service
+Result:   thermaltune status"
+        echo "deferred calibration scheduled — runs at next boot with AC power"
+        return 0
+    fi
+
     heavy="$(detect_heavy_apps)"
     list_text="none detected"
     [ -n "$heavy" ] && list_text="$heavy"
@@ -1495,7 +1573,7 @@ cmd_selftest() {
 # -------------------------------------------------------------------- main ---
 
 usage() {
-    sed -n '2,44p' "$SELF" | sed 's/^# \{0,1\}//'
+    sed -n '2,46p' "$SELF" | sed 's/^# \{0,1\}//'
     echo
     echo "full help is in the header of $SELF and in README.md"
 }
@@ -1509,6 +1587,7 @@ main() {
             --load-seconds) LOAD_S="$2"; shift 2 ;;
             --mode) MODE="$2"; shift 2 ;;
             --engine) ENGINE="$2"; shift 2 ;;
+            --defer) DEFER="1"; shift ;;
             -h|--help) usage; exit 0 ;;
             --version|version) echo "thermaltune $VERSION"; exit 0 ;;
             *) break ;;
@@ -1536,6 +1615,7 @@ main() {
             shift
             case "${1:-}" in
                 calibrate) shift; cmd_internal_calibrate "$@" ;;
+                defer-calibration) cmd_internal_defer_calibration ;;
                 adaptive-loop) cmd_internal_adaptive_loop ;;
                 *) die "unknown internal command" ;;
             esac

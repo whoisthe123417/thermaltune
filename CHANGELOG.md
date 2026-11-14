@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 — 2026-11-15
+
+- `calibrate --defer`: schedule the calibration to run **unattended at the
+  next boot with AC power** (one-shot systemd unit, no popups, self-removes
+  after one run). For machines whose owner can't spare the 40 minutes.
+- calibrate now parses its own flags, so `thermaltune calibrate --defer`
+  and `thermaltune calibrate --profile quick` work as typed.
+- honest time estimates: typical duration now assumes the sweep stops early
+  (measured real run: ~35 min; old estimate claimed ~63).
+
 ## 0.2.1 — 2026-11-14
 
 - fix: kHz/MHz unit mismatch between the cap reference passed to the

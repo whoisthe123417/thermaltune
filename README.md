@@ -5,6 +5,7 @@
 ```
 thermaltune calibrate     # ~40 min, finds + applies + persists the sweet spot
 thermaltune calibrate --mode adaptive   # bursts at full speed, clamped when hot
+thermaltune calibrate --defer           # schedule the run for the next AC boot
 thermaltune mode adaptive # switch modes later (uses the saved calibration)
 thermaltune check         # ~5 min, verifies the saved calibration still holds
 thermaltune status        # what's currently applied
