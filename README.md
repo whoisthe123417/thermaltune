@@ -171,6 +171,17 @@ Uninstall: `sudo thermaltune uninstall`.
 - Alternative calibration workloads (`--workload`)
 - P/E-core aware caps for hybrid Intel CPUs
 
+## Credits
+
+- **GLM (via OpenCode)** — designed, wrote, and debugged every line of this tool,
+  against a real machine, over two days
+- **@whoisthe123417** — the hardware, the testing, the calibration runs, and the
+  decision to publish
+
+Every commit carries a `Co-Authored-By: GLM` trailer — the AI authorship is in
+the history itself, not just this label.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
