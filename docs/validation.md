@@ -51,6 +51,33 @@ on unstable configs and never exceeded 80 °C at the flat point — peak
 temperature is the fastest reliable sawtooth indicator, which is why
 `thermaltune check` judges primarily by peak-vs-baseline.
 
+## AC acceptance run (thermaltune 0.2.4, 2026-11-15)
+
+The first fully-automated AC calibration (run `20261115-160528`, thorough
+profile, target 85 °C, `systemd-inhibit`-protected) reproduced the manual
+ground truth and refined it:
+
+| Step | max_perf_pct | Peak temp | Steady clock | Dips | Verdict |
+|---|---|---|---|---|---|
+| baseline-100 | 100 | 100 °C | sawtooth | 48% | unstable |
+| sweep-85 | 85 | 100 °C | sawtooth | 64% | unstable |
+| sweep-73 | 73 | 99 °C | sawtooth | 50% | unstable |
+| sweep-63 | 63 | 86 °C | 2300 MHz flat | 0% | unstable (peak > target) |
+| sweep-55 | 55 | 78 °C | 2000 MHz flat | 0% | stable |
+| refine-59 | 59 | 83 °C | 2200 MHz flat | 0% | stable |
+| confirm-high-66 | 66 | 89 °C | sawtooth | 42% | unstable |
+| confirm-final | 59 | 82 °C | 2200 MHz flat | 0% | stable → saved |
+
+Result: **cap 59% (~2.2 GHz all-core)**, peak 82 °C, 4856 ops/s — the tool
+landed one refinement step above the manual 55% point, verified 59% holds
+(twice), and verified 66% collapses back into the sawtooth.
+
+- Capped at 59% the machine sustains **+14% more throughput than
+  uncapped** (4856 vs 4266 ops/s) while peaking 18 °C cooler: uncapped,
+  the CPU burns 16 W sawtoothing at 100 °C and delivers less work.
+- The analyzer judged every step exactly as the manual analysis
+  predicts, including the temp-only fail of a flat-but-86 °C 63% step.
+
 ## Selftest
 
 `thermaltune --selftest` re-analyzes recorded calibration CSVs and must

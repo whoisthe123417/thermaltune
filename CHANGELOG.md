@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.5 — 2026-11-15
+
+- flag validation before anything else: `--profile garbage` dies instead
+  of silently running the thorough sweep, `--target-temp` must be an
+  integer 40-95 C (a garbage value previously became 0 inside the
+  analyzer and judged every step unstable), `--load-seconds` must be
+  30-600, and `--mode`/`--engine` are checked before any popup or
+  elevation. Found by static review during the first AC acceptance run.
+- flags with a missing value (`thermaltune calibrate --profile`) now die
+  with a clear message instead of an unbound-variable crash.
+- the TTY engine picker could not be answered: its prompt offered [1/2]
+  but only the words ttc/thermald were accepted — typing 1 or 2 died
+  with "no engine selected". Both now work.
+- `check` printed "limit 8%" for floor dips while the analyzer gates at
+  5% — text aligned to 5%.
+- kdialog engine radiolist: dropped `--separate-output` (a checklist
+  flag; radiolist already outputs the plain tag).
+- TTY consent/deferred prompts printed their message twice (once
+  directly, once via ui_ask) — collapsed to a single call.
+- doctor: thermald readiness now reports `rapl_controller` correctly
+  when run as root, and notes it when run as an unprivileged user.
+- the battery warning no longer prints the -1 sentinel on machines
+  without a battery.
+
 ## 0.2.4 — 2026-11-15
 
 - suspend protection is now real (found by the first suspended-calibration

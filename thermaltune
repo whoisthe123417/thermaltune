@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.4"
+VERSION="0.2.5"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -295,7 +295,7 @@ choose_engine() {
         kdialog)
             choice="$(kdialog --title 'thermaltune — engine' --radiolist "$msg" \
                 thermald 'thermald (standard daemon)' off \
-                ttc 'ttc (thermaltune controller)' off --separate-output 2>/dev/null)"
+                ttc 'ttc (thermaltune controller)' off 2>/dev/null)"
             ;;
         zenity)
             choice="$(zenity --list --radiolist --title='thermaltune — engine' --text="$msg" \
@@ -309,8 +309,8 @@ choose_engine() {
             ;;
     esac
     case "$choice" in
-        *ttc*) echo ttc ;;
-        *thermald*) echo thermald ;;
+        thermald*|1) echo thermald ;;
+        ttc*|2) echo ttc ;;
         *) return 1 ;;
     esac
 }
@@ -754,9 +754,13 @@ cmd_doctor() {
     echo "  hardware crit:    ${crit_c} C -> default target ${target} C"
     echo "== adaptive mode readiness"
     local acdev
+    rapl_ok && RAPL_AVAILABLE=1
     acdev="$(find_thermal_cdev 2>/dev/null || true)"
     if [ -n "$acdev" ]; then
         echo "  [ok] thermald engine possible (control device: $acdev)"
+        if [ "$acdev" != "rapl_controller" ] && ! rapl_ok; then
+            echo "       (as root, thermald may prefer its built-in rapl_controller instead)"
+        fi
     else
         echo "  [warn] no cooling device thermald can drive — thermald engine cannot engage; use engine ttc"
     fi
@@ -850,7 +854,7 @@ cmd_check() {
     [ "${STABLE:-0}" = "1" ] || verdict="FAIL"
     echo "check result: $verdict"
     echo "  peak temp:   ${PEAK_T} C (baseline +6 margin)"
-    echo "  floor dips:  ${DIPS_FRAC:-NA}% (limit 8%)"
+    echo "  floor dips:  ${DIPS_FRAC:-NA}% (limit 5%)"
     echo "  clock:       ${STEADY_F:-NA} MHz (${RATIO:-NA}% of cap)"
     if [ "$verdict" = "PASS" ]; then
         log "saved cap is still valid for current conditions"
@@ -937,15 +941,24 @@ cmd_calibrate() {
     # per-command flags (so "thermaltune calibrate --defer" works naturally)
     while [ $# -gt 0 ]; do
         case "$1" in
-            --profile) PROFILE="$2"; shift 2 ;;
-            --target-temp) TARGET_TEMP="$2"; shift 2 ;;
-            --load-seconds) LOAD_S="$2"; shift 2 ;;
-            --mode) MODE="$2"; shift 2 ;;
-            --engine) ENGINE="$2"; shift 2 ;;
+            --profile) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; PROFILE="$2"; shift 2 ;;
+            --target-temp) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; TARGET_TEMP="$2"; shift 2 ;;
+            --load-seconds) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; LOAD_S="$2"; shift 2 ;;
+            --mode) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; MODE="$2"; shift 2 ;;
+            --engine) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; ENGINE="$2"; shift 2 ;;
             --defer) DEFER="1"; shift ;;
             *) die "unknown calibrate option: $1 (see --help)" ;;
         esac
     done
+    # ---- flag validation (fail fast, before any popup or elevation) ----
+    case "$PROFILE" in quick|thorough) ;; *) die "unknown profile: '$PROFILE' (use --profile quick|thorough)" ;; esac
+    case "$MODE" in cap|adaptive) ;; *) die "unknown mode: '$MODE' (use --mode cap|adaptive)" ;; esac
+    case "$ENGINE" in ""|thermald|ttc) ;; *) die "unknown engine: '$ENGINE' (use --engine thermald|ttc)" ;; esac
+    awk -v l="$LOAD_S" 'BEGIN{ exit !(l ~ /^[0-9]+$/ && l >= 30 && l <= 600) }' \
+        || die "invalid --load-seconds: '$LOAD_S' (integer seconds, 30-600)"
+    [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
+    awk -v t="$TARGET_TEMP" 'BEGIN{ exit !(t ~ /^[0-9]+$/ && t >= 40 && t <= 95) }' \
+        || die "invalid --target-temp: '$TARGET_TEMP' (integer Celsius, 40-95)"
     # ---- user phase: consent, deps, preflight ----
     detect_platform
     PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU package temperature sensor found"
@@ -999,15 +1012,19 @@ Install them now with pacman (you will be asked for your password)?"; then
         fi
     fi
 
-    # battery pre-check
+    # battery pre-check (skipped for defer: the run itself requires AC)
     local pstate batt
     pstate="$(power_state)"
     batt="$(battery_pct)"
-    if [ "$pstate" = "battery" ]; then
+    if [ "$DEFER" != "1" ] && [ "$pstate" = "battery" ]; then
         if [ "$batt" -ge 0 ] && [ "$batt" -lt 50 ]; then
             die "battery at ${batt}% — plug in AC before calibrating"
         fi
-        warn "running on battery (${batt}%) — results may differ on AC; AC calibration is recommended"
+        if [ "$batt" -ge 0 ]; then
+            warn "running on battery (${batt}%) — results may differ on AC; AC calibration is recommended"
+        else
+            warn "running on battery (level unknown) — results may differ on AC; AC calibration is recommended"
+        fi
     fi
 
     [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
@@ -1033,12 +1050,7 @@ At your NEXT BOOT with AC power, thermaltune runs unattended:
 Skipped checks: heavy apps (fresh boot), battery (AC required anyway).
 
 Schedule this?"
-        if [ "$UI_TOOL" = "tty" ]; then
-            printf '%s\n' "$dmsg" >&2
-            ui_ask "thermaltune" "Schedule deferred calibration?" || die "aborted by user"
-        else
-            ui_ask "thermaltune" "$dmsg" || die "aborted by user"
-        fi
+        ui_ask "thermaltune" "$dmsg" || die "aborted by user"
         log "scheduling deferred calibration (one sudo password needed)..."
         local rc=0
         sudo -p "[thermaltune] password: " bash "$SELF" --_internal defer-calibration || rc=$?
@@ -1087,12 +1099,7 @@ Detected heavy apps — please close them first:
 
 Start calibration now?"
     fi
-    if [ "$UI_TOOL" = "tty" ]; then
-        printf '%s\n' "$msg" >&2
-        ui_ask "thermaltune" "Start calibration now?" || die "aborted by user"
-    else
-        ui_ask "thermaltune" "$msg" || die "aborted by user"
-    fi
+    ui_ask "thermaltune" "$msg" || die "aborted by user"
 
     # ---- hand off to root phase ----
     printf 'PROFILE=%s\nTARGET_TEMP=%s\nMODE=%s\nENGINE=%s\n' "$PROFILE" "$TARGET_TEMP" "$MODE" "$ENGINE" > "$ANSWERS"
@@ -1598,11 +1605,11 @@ main() {
     # global flags
     while [ $# -gt 0 ]; do
         case "$1" in
-            --profile) PROFILE="$2"; shift 2 ;;
-            --target-temp) TARGET_TEMP="$2"; shift 2 ;;
-            --load-seconds) LOAD_S="$2"; shift 2 ;;
-            --mode) MODE="$2"; shift 2 ;;
-            --engine) ENGINE="$2"; shift 2 ;;
+            --profile) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; PROFILE="$2"; shift 2 ;;
+            --target-temp) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; TARGET_TEMP="$2"; shift 2 ;;
+            --load-seconds) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; LOAD_S="$2"; shift 2 ;;
+            --mode) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; MODE="$2"; shift 2 ;;
+            --engine) [ $# -ge 2 ] || die "option $1 needs a value (see --help)"; ENGINE="$2"; shift 2 ;;
             --defer) DEFER="1"; shift ;;
             -h|--help) usage; exit 0 ;;
             --version|version) echo "thermaltune $VERSION"; exit 0 ;;
