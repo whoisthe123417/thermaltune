@@ -169,33 +169,55 @@ recorded calibration data this tool was developed on.
 
 ## Install & correct usage
 
+**1 — Get it and check your machine** (safe, read-only, no sudo yet):
+
 ```bash
 git clone https://github.com/whoisthe123417/thermaltune-universalfixer
 cd thermaltune-universalfixer
-./thermaltune doctor      # 1. read-only audit: drivers, sensors, conflicting daemons
+./thermaltune doctor
 ```
 
-2. **Run as your user, never with `sudo` in front** — the tool elevates itself
-   and keeps GUI popups available.
-3. Close heavy apps (the consent popup lists detected ones) and **plug in AC** —
-   calibrate on the power state you use most; AC and battery flat points differ.
-4. `./thermaltune calibrate` — one consent popup, one sudo password, then
-   hands-off (~35–40 min): lid open, machine idle, fans loud at 100 °C moments
-   is the *measurement working*. Suspend is blocked for the run; Ctrl+C aborts
-   safely and restores the previous cap.
-5. Can't supervise now? `./thermaltune calibrate --defer` — it runs unattended
-   at the next boot with AC power, then removes itself.
-6. The found cap is applied, saved, and persists across reboot and suspend.
-   Verify with `./thermaltune status` and re-verify after big changes with
-   `./thermaltune check` (~5 min full-load test).
+…or without git:
 
-Optional adaptive mode: `./thermaltune calibrate --mode adaptive` (engine
-popup: thermald or the built-in ttc controller) — or switch later with
-`./thermaltune mode adaptive`. Engines are mutually exclusive; switching
-stops the other automatically.
+```bash
+curl -LO https://github.com/whoisthe123417/thermaltune-universalfixer/releases/download/v0.2.8/thermaltune
+sha256sum -c thermaltune.sha256 && chmod +x thermaltune
+./thermaltune doctor
+```
 
-Everyday: `thermaltune off` (no clamping until next boot), `thermaltune apply`
-(re-apply saved state), `sudo thermaltune uninstall`.
+**2 — Calibrate** (~40 min, hands-off). Close heavy apps, plug in AC, then paste:
+
+```bash
+./thermaltune calibrate
+```
+
+One consent popup, one sudo password, then it runs itself. While it runs:
+lid open, machine idle — fans roaring at 100 °C moments is the *measurement
+working*, not a problem. Suspend is blocked for the run; Ctrl+C aborts safely
+and restores the previous cap. Can't supervise now?
+`./thermaltune calibrate --defer` runs it unattended at the next boot with
+AC power and removes itself.
+
+**3 — Verify and live with it:**
+
+```bash
+./thermaltune status     # what's applied and saved
+./thermaltune check      # 5-min re-verification (seasons, dust, updates)
+./thermaltune off        # unclamp until next boot
+./thermaltune apply      # re-apply the saved state
+```
+
+**Optional — adaptive mode** (bursts at full speed, clamps when hot):
+
+```bash
+./thermaltune calibrate --mode adaptive   # engine popup: thermald or ttc
+./thermaltune mode adaptive               # quick switch later (saved values)
+```
+
+Engines are mutually exclusive — switching stops the other automatically.
+
+Run everything as your user, never `sudo ./thermaltune …` in front — the tool
+elevates itself and keeps popups available. Uninstall: `sudo thermaltune uninstall`.
 
 ## Roadmap
 
