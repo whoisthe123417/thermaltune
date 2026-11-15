@@ -225,7 +225,7 @@ AC power and removes itself.
 ./thermaltune apply      # re-apply the saved state
 ```
 
-**Optional — adaptive mode** (no cap until it gets hot):
+**Optional, but recommended — adaptive mode** (no cap until it gets hot):
 
 ```bash
 ./thermaltune calibrate --mode adaptive   # engine popup: thermald or ttc
