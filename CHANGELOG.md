@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.7 — 2026-11-15
+
+- ttc engine: **proportional response** instead of a fixed-rate ratchet.
+  The first adaptive check exposed the weakness: starting a full burst
+  from idle, the fixed -5%/12 s steps needed ~96 s to walk the cap down
+  and the CPU overshot to 95 C (check failed; the second, warm-started
+  check passed at 87 C). Now the cut scales with overshoot: -15% every
+  4 s at target+8 C, -10% every 6 s at target+3 C, -5% every 12 s near
+  the target; the +2%/12 s recovery is unchanged.
+- install-persistence now restarts an active adaptive service, so a
+  controller update takes effect with the one command (skipped while a
+  calibration is running).
+
 ## 0.2.6 — 2026-11-15
 
 - fix: `thermaltune mode adaptive` died with "unknown mode: mode" — the

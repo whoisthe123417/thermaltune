@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.6"
+VERSION="0.2.7"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -530,6 +530,12 @@ AUNIT
     systemctl enable thermaltune.service >/dev/null 2>&1
     if [ "${ENGINE:-}" = "ttc" ]; then
         systemctl enable thermaltune-adaptive.service >/dev/null 2>&1 || true
+    fi
+    # a running adaptive controller keeps the old code until restarted —
+    # so a reinstall always bounces an active service (skipped mid-calibration)
+    if [ ! -e /run/thermaltune-calibrating ] && systemctl is-active --quiet thermaltune-adaptive.service 2>/dev/null; then
+        systemctl restart thermaltune-adaptive.service
+        log "adaptive service restarted (updated controller active)"
     fi
     log "persistence installed: unit + resume hook enabled (script at $BIN)"
 }
@@ -1531,7 +1537,7 @@ cmd_internal_adaptive_loop() { # ttc engine body — runs as a systemd service (
     PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU temperature sensor found"
     PKG_CRIT_FILE="$(find_pkg_crit || true)"
     echo "[ttc] thermaltune adaptive controller active (poll 2s)"
-    local last_change=0 t target pct
+    local last_change=0 t target pct step gap
     while :; do
         if [ "$(getkey "$CONF" MODE 2>/dev/null)" != "adaptive" ]; then
             sleep 5; continue
@@ -1539,16 +1545,26 @@ cmd_internal_adaptive_loop() { # ttc engine body — runs as a systemd service (
         target="$(getkey "$CONF" ADAPT_TARGET 2>/dev/null)"
         case "${target:-}" in ''|*[!0-9]*) target=85 ;; esac
         t="$(pkg_temp_c)"
-        if [ "$SECONDS" -ge $(( last_change + 12 )) ]; then
-            pct="$(get_cap_pct)"
-            case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
-            if awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 >= T+0)}'; then
+        if awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 >= T+0)}'; then
+            # proportional cut: the further above target, the bigger and faster.
+            # (a fixed -5%/12s ratchet cannot catch a cold-start burst: the first
+            # real check measured a 95C peak because 8 steps took ~96 seconds)
+            if   awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 >= T+8)}'; then step=-15; gap=4
+            elif awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 >= T+3)}'; then step=-10; gap=6
+            else step=-5; gap=12; fi
+            if [ "$SECONDS" -ge $(( last_change + gap )) ]; then
+                pct="$(get_cap_pct)"
+                case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
                 if [ "$pct" -gt 35 ]; then
-                    pct=$(( pct - 5 )); [ "$pct" -lt 35 ] && pct=35
+                    pct=$(( pct + step )); [ "$pct" -lt 35 ] && pct=35
                     set_cap_pct "$pct"; last_change=$SECONDS
                     echo "[ttc] hot ${t}C (target ${target}C) -> cap ${pct}%"
                 fi
-            elif awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 <= T-6)}'; then
+            fi
+        elif awk -v t="$t" -v T="$target" 'BEGIN{exit !(t+0 <= T-6)}'; then
+            if [ "$SECONDS" -ge $(( last_change + 12 )) ]; then
+                pct="$(get_cap_pct)"
+                case "$pct" in ''|*[!0-9]*) pct=100 ;; esac
                 if [ "$pct" -lt 100 ]; then
                     pct=$(( pct + 2 )); [ "$pct" -gt 100 ] && pct=100
                     set_cap_pct "$pct"; last_change=$SECONDS
