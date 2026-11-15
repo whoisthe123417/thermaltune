@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.8 — 2026-11-15
+
+- fix: the two adaptive engines could run at once. The first real
+  thermald-engine calibration left the ttc controller (started earlier
+  via `mode adaptive`) running, and ttc blindly followed the config's
+  new target and fought thermald during the verification check —
+  the check passed but measured the wrong controller. Now:
+  - the ttc loop stands down and exits when ADAPT_ENGINE is not ttc
+  - engine selection in `mode` and `calibrate` stops the other engine
+    (both directions)
+  - `apply` enforces exclusivity at every boot/resume (it runs from
+    the boot unit and the resume hook), so the system self-heals to
+    exactly one active engine
+- fix: `install-persistence` required manual sudo while every other
+  command self-elevates — it now prompts for the password like the
+  rest (found when the update command failed and the old controller
+  code stayed live).
+
 ## 0.2.7 — 2026-11-15
 
 - ttc engine: **proportional response** instead of a fixed-rate ratchet.

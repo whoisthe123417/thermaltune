@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.7"
+VERSION="0.2.8"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -541,6 +541,7 @@ AUNIT
 }
 
 cmd_install_persistence() {
+    [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" install-persistence
     do_install_persistence
 }
 
@@ -606,10 +607,13 @@ cmd_apply() {
     set_cap_pct "$pct"
     if [ "$mode" = "adaptive" ]; then
         engine="$(getkey "$CONF" ADAPT_ENGINE)"
+        [ -n "$engine" ] || engine=ttc
         if [ "$engine" = "ttc" ]; then
+            systemctl disable --now thermald.service >/dev/null 2>&1 || true
             systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
             echo "adaptive applied: controller service active, ceiling ${pct}%"
         else
+            systemctl disable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
             systemctl enable --now thermald.service >/dev/null 2>&1 || true
             systemctl restart thermald.service 2>/dev/null || true
             echo "adaptive applied: thermald active with thermaltune target, ceiling ${pct}%"
@@ -664,6 +668,10 @@ cmd_mode() { # [cap|adaptive] — switch operating mode using saved calibration
         set_conf_key ADAPT_ENGINE "$engine"
         set_conf_key ADAPT_TARGET "$target"
         if [ "$engine" = "ttc" ]; then
+            if systemctl is-active --quiet thermald.service 2>/dev/null; then
+                systemctl disable --now thermald.service >/dev/null 2>&1 || true
+                log "thermald stopped (the two engines are mutually exclusive)"
+            fi
             do_install_persistence
             systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
             systemctl is-active thermaltune-adaptive.service >/dev/null 2>&1 \
@@ -673,6 +681,10 @@ cmd_mode() { # [cap|adaptive] — switch operating mode using saved calibration
             local cdev
             cdev="$(find_thermal_cdev 2>/dev/null || true)"
             [ -n "$cdev" ] || die "no cooling device for the thermald engine — run: thermaltune calibrate --mode adaptive --engine ttc"
+            if systemctl is-active --quiet thermaltune-adaptive.service 2>/dev/null; then
+                systemctl disable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
+                log "ttc controller stopped (the two engines are mutually exclusive)"
+            fi
             backup_thermald_conf
             write_thermald_conf "$target" "$cdev"
             systemctl enable --now thermald.service >/dev/null 2>&1 || true
@@ -1443,6 +1455,10 @@ cmd_internal_adaptive_calibrate() {
             die "no cooling device thermald can drive — try: thermaltune calibrate --mode adaptive --engine ttc"
         fi
         echo "[thermald] control device: $cdev"
+        if systemctl is-active --quiet thermaltune-adaptive.service 2>/dev/null; then
+            systemctl disable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
+            log "ttc controller stopped (the two engines are mutually exclusive)"
+        fi
         backup_thermald_conf
         write_thermald_conf "$target" "$cdev"
         systemctl unmask thermald.service >/dev/null 2>&1 || true
@@ -1472,6 +1488,10 @@ cmd_internal_adaptive_calibrate() {
         fi
     else
         echo "[ttc] installing controller (target ${target}C) ..."
+        if systemctl is-active --quiet thermald.service 2>/dev/null; then
+            systemctl disable --now thermald.service >/dev/null 2>&1 || true
+            log "thermald stopped (the two engines are mutually exclusive)"
+        fi
         write_conf adaptive 100 "$TARGET_TEMP" "$(power_state)" "" "" "" "$target" ttc
         do_install_persistence
         systemctl enable --now thermaltune-adaptive.service >/dev/null 2>&1 || true
@@ -1537,10 +1557,16 @@ cmd_internal_adaptive_loop() { # ttc engine body — runs as a systemd service (
     PKG_TEMP_FILE="$(find_pkg_temp)" || die "no CPU temperature sensor found"
     PKG_CRIT_FILE="$(find_pkg_crit || true)"
     echo "[ttc] thermaltune adaptive controller active (poll 2s)"
-    local last_change=0 t target pct step gap
+    local last_change=0 t target pct step gap eng
     while :; do
         if [ "$(getkey "$CONF" MODE 2>/dev/null)" != "adaptive" ]; then
             sleep 5; continue
+        fi
+        # mutual exclusion: stand down when another engine owns adaptive mode
+        eng="$(getkey "$CONF" ADAPT_ENGINE 2>/dev/null)"
+        if [ -n "${eng:-}" ] && [ "$eng" != "ttc" ]; then
+            echo "[ttc] adaptive engine is '$eng' — standing down"
+            exit 0
         fi
         target="$(getkey "$CONF" ADAPT_TARGET 2>/dev/null)"
         case "${target:-}" in ''|*[!0-9]*) target=85 ;; esac
