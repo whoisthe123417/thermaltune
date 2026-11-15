@@ -11,7 +11,7 @@ The installed command is `thermaltune`; the project is thermaltune-universalfixe
 
 ```
 thermaltune calibrate     # ~40 min, finds + applies + persists the sweet spot
-thermaltune calibrate --mode adaptive   # bursts at full speed, clamped when hot
+thermaltune calibrate --mode adaptive   # no cap until it gets hot
 thermaltune calibrate --defer           # schedule the run for the next AC boot
 thermaltune mode adaptive # switch modes later (uses the saved calibration)
 thermaltune check         # ~5 min, verifies the saved calibration still holds
@@ -207,7 +207,7 @@ AC power and removes itself.
 ./thermaltune apply      # re-apply the saved state
 ```
 
-**Optional — adaptive mode** (bursts at full speed, clamps when hot):
+**Optional — adaptive mode** (no cap until it gets hot):
 
 ```bash
 ./thermaltune calibrate --mode adaptive   # engine popup: thermald or ttc
