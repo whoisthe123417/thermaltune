@@ -1,6 +1,8 @@
-# thermaltune
+# thermaltune-universalfixer
 
-**Calibrate the highest stable CPU frequency cap on thermally-limited Linux laptops.**
+**Calibrate the highest stable CPU frequency cap on thermally-limited Linux laptops — universal across desktops, drivers, and shells.**
+
+The installed command is `thermaltune`; the project is thermaltune-universalfixer.
 
 > **Made by AI.** thermaltune was designed, written, and debugged by an AI coding agent
 > (OpenCode, GLM model) working with one human tester on one real machine. Every claim
