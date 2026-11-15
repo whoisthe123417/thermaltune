@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -626,6 +626,10 @@ cmd_off() {
 }
 
 cmd_mode() { # [cap|adaptive] — switch operating mode using saved calibration
+    # validate before elevating: a typo must not cost a sudo password
+    if [ -n "${1:-}" ] && [ "$1" != "cap" ] && [ "$1" != "adaptive" ]; then
+        die "unknown mode: $1 (cap|adaptive)"
+    fi
     [ "$(id -u)" = 0 ] || exec sudo -p "[thermaltune] password: " bash "$SELF" mode "$@"
     [ -f "$CONF" ] || die "no calibration saved yet — run: thermaltune calibrate"
     local want cur engine target
@@ -1630,7 +1634,7 @@ main() {
         doctor) cmd_doctor ;;
         apply|on) cmd_apply ;;
         off) cmd_off ;;
-        mode) cmd_mode "$@" ;;
+        mode) shift; cmd_mode "$@" ;;
         uninstall) cmd_uninstall ;;
         install-persistence) cmd_install_persistence ;;
         --selftest) shift; cmd_selftest "$@" ;;

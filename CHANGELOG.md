@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.6 — 2026-11-15
+
+- fix: `thermaltune mode adaptive` died with "unknown mode: mode" — the
+  dispatcher passed the subcommand through unshifted, so cmd_mode saw the
+  literal word "mode" as its argument (found on the first real use,
+  right after the AC acceptance run). Also validates the argument before
+  the sudo re-exec, so a typo no longer costs a password prompt.
+
 ## 0.2.5 — 2026-11-15
 
 - flag validation before anything else: `--profile garbage` dies instead
