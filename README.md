@@ -2,6 +2,11 @@
 
 **Calibrate the highest stable CPU frequency cap on thermally-limited Linux laptops.**
 
+> **Made by AI.** thermaltune was designed, written, and debugged by an AI coding agent
+> (OpenCode, GLM model) working with one human tester on one real machine. Every claim
+> in this README was verified on real hardware — the full measurement story, including
+> the bugs found along the way: [docs/validation.md](docs/validation.md).
+
 ```
 thermaltune calibrate     # ~40 min, finds + applies + persists the sweet spot
 thermaltune calibrate --mode adaptive   # bursts at full speed, clamped when hot
