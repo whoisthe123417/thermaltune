@@ -155,20 +155,38 @@ get a full rollback, not a false sense of safety.
 Run `thermaltune --selftest` to validate the measurement analyzer against the
 recorded calibration data this tool was developed on.
 
-## Install
+## Install & correct usage
 
 ```bash
-git clone <this repo> && cd thermaltune
-./thermaltune doctor      # see what it thinks of your machine
-./thermaltune calibrate   # the real thing (asks for sudo internally)
+git clone https://github.com/whoisthe123417/thermaltune-universalfixer
+cd thermaltune-universalfixer
+./thermaltune doctor      # 1. read-only audit: drivers, sensors, conflicting daemons
 ```
 
-Uninstall: `sudo thermaltune uninstall`.
+2. **Run as your user, never with `sudo` in front** — the tool elevates itself
+   and keeps GUI popups available.
+3. Close heavy apps (the consent popup lists detected ones) and **plug in AC** —
+   calibrate on the power state you use most; AC and battery flat points differ.
+4. `./thermaltune calibrate` — one consent popup, one sudo password, then
+   hands-off (~35–40 min): lid open, machine idle, fans loud at 100 °C moments
+   is the *measurement working*. Suspend is blocked for the run; Ctrl+C aborts
+   safely and restores the previous cap.
+5. Can't supervise now? `./thermaltune calibrate --defer` — it runs unattended
+   at the next boot with AC power, then removes itself.
+6. The found cap is applied, saved, and persists across reboot and suspend.
+   Verify with `./thermaltune status` and re-verify after big changes with
+   `./thermaltune check` (~5 min full-load test).
+
+Optional adaptive mode: `./thermaltune calibrate --mode adaptive` (engine
+popup: thermald or the built-in ttc controller) — or switch later with
+`./thermaltune mode adaptive`. Engines are mutually exclusive; switching
+stops the other automatically.
+
+Everyday: `thermaltune off` (no clamping until next boot), `thermaltune apply`
+(re-apply saved state), `sudo thermaltune uninstall`.
 
 ## Roadmap
 
-- Adaptive mode (thermald + ttc engines) — **shipped in 0.2.0**; hardware
-  acceptance run pending on the dev machine
 - Per-power-state calibration (AC vs battery)
 - Alternative calibration workloads (`--workload`)
 - P/E-core aware caps for hybrid Intel CPUs
