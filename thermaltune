@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -548,7 +548,8 @@ After=multi-user.target thermaltune.service
 ConditionACPower=yes
 
 [Service]
-Type=simple
+Type=oneshot
+TimeoutStartSec=2h
 ExecStartPre=/bin/sh -c 'printf "PROFILE=%s\\nTARGET_TEMP=%s\\nMODE=cap\\nENGINE=\\n" "$PROFILE" "$TARGET_TEMP" > $DEFER_ANSWERS'
 ExecStart=$BIN --_internal calibrate $DEFER_ANSWERS
 ExecStartPost=/bin/rm -f $DEFER_ANSWERS
@@ -1540,7 +1541,11 @@ cmd_internal_adaptive_loop() { # ttc engine body — runs as a systemd service (
 # ---------------------------------------------------------------- selftest ---
 
 cmd_selftest() {
-    local dir="${1:-/tmp/opencode/thermal}"
+    local dir="${1:-}"
+    if [ -z "$dir" ]; then
+        dir="$(dirname "$SELF")/tests/data"
+        [ -d "$dir" ] || dir="/tmp/opencode/thermal"
+    fi
     [ -d "$dir" ] || die "selftest data dir not found: $dir (recorded data from the machine thermaltune was developed on)"
     # label -> cap MHz mapping for the recorded runs
     # (cap1.0GHz.. = manual harness runs; sweep-*/baseline-100 = real

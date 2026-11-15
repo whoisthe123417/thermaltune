@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.3 — 2026-11-15
+
+- fix: the deferred-calibration unit used `Type=simple`, under which
+  systemd starts `ExecStartPost` as soon as the process spawns — so the
+  cleanup raced the calibration and deleted the answers file before the
+  first read ("answers file missing", seen on the first real boot-time
+  run). Now `Type=oneshot` + `TimeoutStartSec=2h`: cleanup runs strictly
+  after the calibration finishes, and a failed run stays scheduled for
+  the next AC boot as documented.
+- selftest fixtures relocated into the repo (`tests/data`, committed):
+  the /tmp fixture directory did not survive a reboot. The six
+  root-recorded CSVs from the first real run are now permanent
+  regression data; the six manual-harness CSVs were lost with /tmp
+  (their numbers remain in docs/validation.md).
+
 ## 0.2.2 — 2026-11-15
 
 - `calibrate --defer`: schedule the calibration to run **unattended at the

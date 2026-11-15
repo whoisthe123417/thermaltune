@@ -53,11 +53,16 @@ temperature is the fastest reliable sawtooth indicator, which is why
 
 ## Selftest
 
-`thermaltune --selftest` re-analyzes the recorded CSV data from these runs and
-must reproduce exactly these stability verdicts: unstable for uncapped,
-2.8 GHz, 2.4 GHz, 2.2 GHz; stable for 1.0 GHz and 2.0 GHz. Current status:
-**6/6 passing** (metrics reproduce the table above: steady temps, clocks and
-power match to the displayed precision).
+`thermaltune --selftest` re-analyzes recorded calibration CSVs and must
+reproduce exactly these stability verdicts: unstable for uncapped, 2.8 GHz,
+2.4 GHz, 2.2 GHz; stable for 1.0 GHz and 2.0 GHz. At validation time it
+validated both fixture sets against the numbers above: **12/12 passing**
+(steady temps, clocks and power matched to the displayed precision).
+
+The six manual-harness CSVs lived in /tmp and were lost in a reboot wipe;
+their numbers are preserved in the tables above. The six root-recorded CSVs
+from the first real end-to-end run now live in the repo as committed
+regression fixtures (`tests/data/`) and are the selftest's default data set.
 
 ## First real end-to-end run (battery, 2026-11-14 23:10)
 

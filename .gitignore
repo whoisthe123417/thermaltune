@@ -1,7 +1,7 @@
 # runtime artifacts (never commit local calibration output)
 runs/
-*.csv
-*.log
-*.tstat
+result.env
+summary.txt
+# ...except committed regression fixtures live in tests/data
 result.env
 summary.txt
