@@ -5,3 +5,4 @@ summary.txt
 # ...except committed regression fixtures live in tests/data
 result.env
 summary.txt
+*.sha256

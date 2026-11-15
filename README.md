@@ -56,6 +56,18 @@ performance for cooling headroom it didn't need.
 thermaltune automates finding that flat point on any machine instead of
 guessing.
 
+## What the automated runs achieved (2026-11-15, AC)
+
+| Automated run | Outcome |
+|---|---|
+| cap calibration (thorough, target 85 °C) | converged to **59% ≈ 2.2 GHz dead flat**, peak 82 °C — 4856 vs 4266 ops/s uncapped in the same session (**+14% sustained**), one refinement step above the manual 55% sweet spot |
+| the sweep's individual verdicts | 85/73 unstable (sawtooth) · 63 flat-but-86 °C → correct temp-only fail · 55 stable · push-up to 66 correctly rejected |
+| adaptive calibration (thermald engine) | thermald engaged for real (rapl_controller); verify ladder 94 → 85 → **77 °C held** at 1881 MHz; operating target auto-derived at 75 °C |
+| adaptive verification check | ran as a true single-controller test after the engine-exclusivity fix (journal-verified: no second controller active) |
+
+Step tables, fixture data and every bug the hardware found along the way:
+[docs/validation.md](docs/validation.md).
+
 ## How it works
 
 1. **Baseline** — one sustained all-core run at full speed. If that already
