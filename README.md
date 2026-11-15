@@ -96,6 +96,24 @@ just typing. Adaptive mode does the smarter thing: **full speed in bursts,
 automatic clamping only when the CPU actually gets hot.** Same peak
 temperature protection, more responsiveness.
 
+**What that gets you:**
+
+- **Full speed when the machine is cool** — browsing, typing, opening apps:
+  no cap at all, the CPU runs like it's uncapped, because it is
+- **Short bursts are faster than under any fixed cap** — launching an app or
+  a 30-second compile finishes before heat even builds up, so the clamp
+  never touches it
+- **No permanent performance tax** — a fixed cap never lets the CPU sprint;
+  adaptive only slows it down when it's earned it (read: overheated)
+- **Same heat protection as cap mode** — on the dev machine it held 77 °C
+  against a 75 °C target under full load
+- **Switching is free** — `thermaltune mode cap` / `thermaltune mode
+  adaptive` flips instantly from the saved calibration, no recalibration
+
+The one tradeoff: under a heavy all-core load for hours, a fixed cap runs
+slightly cooler and flatter. Pick adaptive if you use the machine for
+everything, cap mode if you mostly cook it.
+
 ```
 thermaltune calibrate --mode adaptive
 thermaltune mode adaptive   # or cap — later, from the saved calibration
