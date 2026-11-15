@@ -48,7 +48,7 @@
 set -u
 umask 022
 
-VERSION="0.2.3"
+VERSION="0.2.4"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 CONF="/etc/thermaltune.conf"
@@ -56,6 +56,7 @@ UNIT="/etc/systemd/system/thermaltune.service"
 HOOK="/usr/lib/systemd/system-sleep/thermaltune-resume"
 BIN="/usr/local/bin/thermaltune"
 RUNS_ROOT="/var/lib/thermaltune/runs"
+CAL_GUARD="/run/thermaltune-calibrating"
 ANSWERS="${TMPDIR:-/tmp}/thermaltune-answers.$$.env"
 THERMALD_CONF="/etc/thermald/thermal-conf.xml"
 THERMALD_CONF_BAK="/etc/thermald/thermal-conf.xml.pre-thermaltune"
@@ -82,7 +83,7 @@ UI_TOOL="tty"
 PKG_TEMP_FILE=""
 PKG_CRIT_FILE=""
 
-die()   { echo "thermaltune: error: $*" >&2; exit 1; }
+die()   { echo "thermaltune: error: $*" >&2; rm -f "$CAL_GUARD" 2>/dev/null; exit 1; }
 log()   { echo "[thermaltune] $*"; }
 warn()  { echo "[thermaltune] WARNING: $*" >&2; }
 
@@ -505,7 +506,8 @@ UNIT
     cat > "$HOOK" <<HOOK
 #!/bin/bash
 # thermaltune resume hook — re-apply the calibrated cap after suspend
-if [ "\$1" = post ]; then
+# (skipped while a calibration is running: /run/thermaltune-calibrating)
+if [ "\$1" = post ] && [ ! -e /run/thermaltune-calibrating ]; then
     $BIN apply >/dev/null 2>&1 || true
 fi
 HOOK
@@ -551,7 +553,7 @@ ConditionACPower=yes
 Type=oneshot
 TimeoutStartSec=2h
 ExecStartPre=/bin/sh -c 'printf "PROFILE=%s\\nTARGET_TEMP=%s\\nMODE=cap\\nENGINE=\\n" "$PROFILE" "$TARGET_TEMP" > $DEFER_ANSWERS'
-ExecStart=$BIN --_internal calibrate $DEFER_ANSWERS
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle $BIN --_internal calibrate $DEFER_ANSWERS
 ExecStartPost=/bin/rm -f $DEFER_ANSWERS
 ExecStartPost=/usr/bin/systemctl disable thermaltune-autocal.service
 
@@ -1097,7 +1099,12 @@ Start calibration now?"
     chmod 600 "$ANSWERS"
     log "starting privileged phase (you may be asked for your sudo password)..."
     local rc=0
-    sudo -p "[thermaltune] password: " bash "$SELF" --_internal calibrate "$ANSWERS" || rc=$?
+    # hold a sleep/idle inhibit lock so suspend cannot corrupt the run
+    if command -v systemd-inhibit >/dev/null 2>&1; then
+        sudo -p "[thermaltune] password: " systemd-inhibit --what="sleep:idle" bash "$SELF" --_internal calibrate "$ANSWERS" || rc=$?
+    else
+        sudo -p "[thermaltune] password: " bash "$SELF" --_internal calibrate "$ANSWERS" || rc=$?
+    fi
     rm -f "$ANSWERS"
     if [ "$rc" != "0" ]; then
         die "calibration failed (exit $rc) — previous cap was restored"
@@ -1140,6 +1147,7 @@ available; your machine may be dust-limited. See doctor."
 
 cmd_internal_calibrate() { # $1 = answers file ; runs as root
     [ "$(id -u)" = 0 ] || die "internal phase must run as root"
+    touch "$CAL_GUARD"
     local answers=$1
     [ -f "$answers" ] || die "answers file missing"
     while IFS='=' read -r k v; do
@@ -1168,7 +1176,7 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
     local orig_snapshot
     orig_snapshot="$(snapshot_cap)"
     restore_cap_fn() { printf '%s\n' "$orig_snapshot" | restore_cap; }
-    trap 'restore_cap_fn; echo "[thermaltune] interrupted — previous cap restored" >&2; exit 130' INT TERM
+    trap 'restore_cap_fn; rm -f "$CAL_GUARD"; echo "[thermaltune] interrupted — previous cap restored" >&2; exit 130' INT TERM
 
     # idle sanity pre-check
     echo "[precheck] settling ${SETTLE_S}s before baseline ..."
@@ -1202,6 +1210,7 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
         chmod 644 "$run_dir"/*.env "$run_dir"/*.csv "$run_dir"/*.tstat "$run_dir"/*.log 2>/dev/null
         ln -sfn "$run_dir" "$RUNS_ROOT/latest"
         trap - INT TERM
+        rm -f "$CAL_GUARD"
         set_cap_pct 100
         echo "[done] nothing to apply — full speed is already stable"
         return 0
@@ -1292,6 +1301,7 @@ cmd_internal_calibrate() { # $1 = answers file ; runs as root
     chmod 644 "$run_dir/summary.txt"
 
     trap - INT TERM
+    rm -f "$CAL_GUARD"
     echo "[done] cap ${cand}% applied, saved and persisted"
 }
 
@@ -1400,7 +1410,7 @@ cmd_internal_adaptive_calibrate() {
     local orig_snapshot
     orig_snapshot="$(snapshot_cap)"
     restore_cap_fn() { printf '%s\n' "$orig_snapshot" | restore_cap; }
-    trap 'restore_cap_fn; disable_adaptive_engines >/dev/null 2>&1; echo "[thermaltune] interrupted — previous cap restored, engines disabled" >&2; exit 130' INT TERM
+    trap 'restore_cap_fn; disable_adaptive_engines >/dev/null 2>&1; rm -f "$CAL_GUARD"; echo "[thermaltune] interrupted — previous cap restored, engines disabled" >&2; exit 130' INT TERM
 
     [ -n "$TARGET_TEMP" ] || TARGET_TEMP="$(derive_target_temp)"
     echo "[plan] adaptive calibration: engine=$ENGINE target=${TARGET_TEMP}C load=${LOAD_S}s/step"
@@ -1500,6 +1510,7 @@ cmd_internal_adaptive_calibrate() {
     chmod 644 "$run_dir/summary.txt"
 
     trap - INT TERM
+    rm -f "$CAL_GUARD"
     echo "[done] adaptive mode active: engine=$ENGINE target=${target}C"
 }
 

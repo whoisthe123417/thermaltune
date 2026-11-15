@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.4 — 2026-11-15
+
+- suspend protection is now real (found by the first suspended-calibration
+  incident): the privileged phase runs under `systemd-inhibit
+  --what=sleep:idle`, and the resume hook skips re-applying the cap while
+  `/run/thermaltune-calibrating` exists. Previously the README claimed
+  inhibit protection the code didn't have — a mid-run suspend let the
+  resume hook stomp the cap the calibration had just set (the analyzer's
+  ratio check caught the impostor step and flagged it unstable).
+- the deferred unit's ExecStart is inhibit-wrapped too (a 40-minute
+  boot-time run can outlast an idle timer).
+
 ## 0.2.3 — 2026-11-15
 
 - fix: the deferred-calibration unit used `Type=simple`, under which

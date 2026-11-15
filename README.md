@@ -115,8 +115,10 @@ get a full rollback, not a false sense of safety.
   list of detected heavy apps to close yourself (the tool never kills your
   apps without an explicit flag-level decision — warn-only by design).
 - **Dependencies auto-installed with your consent** via pacman.
-- **Suspend-proof**: calibration runs under `systemd-inhibit`, so an idle
-  timer cannot suspend mid-measurement and corrupt the result.
+- **Suspend-proof**: calibration holds a `systemd-inhibit` lock (sleep and
+  idle are blocked), and a `/run/thermaltune-calibrating` guard makes the
+  resume hook skip re-applying the cap while a run is live — so even a
+  forced suspend cannot corrupt a measurement.
 - **Only lowers ceilings**: it never raises voltage, power limits or clocks.
   Ctrl+C restores the previous cap.
 
